@@ -155,8 +155,10 @@ class ModularCsvService:
         try:
             import arcpy  # noqa: PLC0415
 
-            in_sr = arcpy.SpatialReference(self.input_spatial_ref)
-            out_sr = arcpy.SpatialReference(self.output_spatial_ref)
+            in_sr = arcpy.SpatialReference()
+            in_sr.loadFromString(Path(self.input_spatial_ref).read_text(encoding="utf-8").strip())
+            out_sr = arcpy.SpatialReference()
+            out_sr.loadFromString(Path(self.output_spatial_ref).read_text(encoding="utf-8").strip())
 
             if in_sr.factoryCode == out_sr.factoryCode:
                 return points

@@ -221,6 +221,21 @@ class SnippetConversionService:
         get_logger(__name__).debug("Despike: clamped %d spike points", clamped)
         return result
 
+    @staticmethod
+    def _load_spatial_ref(prj_path: str):
+        """
+        Load an arcpy SpatialReference from a .prj file path.
+
+        Reads the WKT directly and uses loadFromString to avoid arcpy's
+        createFromFile, which rejects forward-slash UNC paths on Windows.
+        """
+        import arcpy  # noqa: PLC0415
+
+        wkt = Path(prj_path).read_text(encoding="utf-8").strip()
+        sr = arcpy.SpatialReference()
+        sr.loadFromString(wkt)
+        return sr
+
     def _reproject(self, points: list[PointRecord]) -> list[PointRecord]:
         """
         Reproject points from input_spatial_ref to output_spatial_ref via arcpy.
@@ -232,19 +247,43 @@ class SnippetConversionService:
         try:
             import arcpy  # noqa: PLC0415
 
-            in_sr = arcpy.SpatialReference(self.input_spatial_ref)
-            out_sr = arcpy.SpatialReference(self.output_spatial_ref)
+            in_sr = self._load_spatial_ref(self.input_spatial_ref)
+            out_sr = self._load_spatial_ref(self.output_spatial_ref)
 
             if in_sr.factoryCode == out_sr.factoryCode:
                 logger.debug("Input and output SRS match — skipping reprojection")
                 return points
 
+            # Discover available datum transformations between the two CRS.
+            # projectAs() returns an empty geometry (firstPoint=None) when no
+            # transformation path exists — we need to supply one explicitly.
+            transformations = arcpy.ListTransformations(in_sr, out_sr)
+            transform = transformations[0] if transformations else None
+            if transform:
+                logger.info("Using datum transformation: %s", transform)
+            else:
+                logger.warning(
+                    "No datum transformation found between '%s' and '%s' — "
+                    "projecting without transformation; results may be inaccurate",
+                    in_sr.name, out_sr.name,
+                )
+
+            null_count = 0
             reprojected: list[PointRecord] = []
             for x, y, z, ts in points:
                 geom = arcpy.PointGeometry(arcpy.Point(x, y, z), in_sr)
-                proj = geom.projectAs(out_sr)
-                fp = proj.firstPoint
+                proj = geom.projectAs(out_sr, transform) if transform else geom.projectAs(out_sr)
+                fp = proj.firstPoint if proj else None
+                if fp is None:
+                    null_count += 1
+                    continue  # skip points that fail to project
                 reprojected.append((fp.X, fp.Y, z, ts))  # Z preserved as-is
+
+            if null_count:
+                logger.warning(
+                    "Reprojection: %d / %d points dropped (projectAs returned null geometry)",
+                    null_count, len(points),
+                )
             logger.info("Reprojected %d points to %s", len(reprojected), self.output_spatial_ref)
             return reprojected
 
@@ -263,7 +302,7 @@ class SnippetConversionService:
         try:
             import arcpy  # noqa: PLC0415
 
-            out_sr = arcpy.SpatialReference(self.output_spatial_ref)
+            out_sr = self._load_spatial_ref(self.output_spatial_ref)
             aoi_geom = None
 
             with arcpy.da.SearchCursor(

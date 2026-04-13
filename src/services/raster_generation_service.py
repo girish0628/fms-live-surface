@@ -103,7 +103,8 @@ class RasterGenerationService:
                 env.overwriteOutput = True
                 env.workspace = self.scratch_gdb
 
-                sr = arcpy.SpatialReference(self.spatial_ref_prj)
+                sr = arcpy.SpatialReference()
+                sr.loadFromString(Path(self.spatial_ref_prj).read_text(encoding="utf-8").strip())
                 out_dir = Path(self.output_dir)
                 out_dir.mkdir(parents=True, exist_ok=True)
 

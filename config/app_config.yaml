@@ -69,6 +69,14 @@ sites:
     aoi_where_clause: "MineSite='NM'"
     failover_share: ""
 
+  MAC:
+    source_type: minestar
+    landing_zone: "//server/GIP/FMS_Landing/MAC/snippet"
+    z_adjustment: 0.0
+    input_spatial_ref: "//waio/standardafs/GISAdmin/GPConfig/Projections/ProjectionFiles/Central Project Grid (CPG94).prj"
+    aoi_where_clause: "MineSite='MAC'"
+    failover_share: ""
+
 # ------------------------------------------------------------------
 # Processing parameters (applied to all sites unless overridden above)
 # ------------------------------------------------------------------
