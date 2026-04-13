@@ -112,13 +112,25 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
     # Step 1b: Modular CSV reprojection
     # ------------------------------------------------------------------
     if source_type in ("modular", "both"):
-        logger.info("--- Step 1b: Modular CSV reprojection ---")
+        logger.info("--- Step 1b: Modular CSV conversion ---")
         modular_svc = ModularCsvService(
             site=site,
             input_folder=landing_zone,
             output_folder=staging_folder,
+            z_adjustment=site_cfg.get("z_adjustment", 0.0),
+            min_neighbours=processing_cfg.get("min_neighbours", 3),
+            max_z=processing_cfg.get("max_z", 4000.0),
+            decimal_digits=processing_cfg.get("decimal_digits", 2),
+            grid_size=int(processing_cfg.get("grid_size", 2)),
+            csv_col_x=site_cfg.get("csv_col_x", 1),
+            csv_col_y=site_cfg.get("csv_col_y", 2),
+            csv_col_z=site_cfg.get("csv_col_z", 3),
+            csv_col_timestamp=site_cfg.get("csv_col_timestamp", 4),
             input_spatial_ref=site_cfg.get("modular_spatial_ref", site_cfg.get("input_spatial_ref", "")),
             output_spatial_ref=processing_cfg.get("output_spatial_ref", ""),
+            aoi_feature_class=processing_cfg.get("aoi_feature_class", ""),
+            aoi_where_clause=site_cfg.get("aoi_where_clause", f"MineSite='{site}'"),
+            despike=processing_cfg.get("despike", True),
         )
         modular_result = modular_svc.process()
         logger.info("Modular CSV result: %s", modular_result["status"])

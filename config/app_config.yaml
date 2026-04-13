@@ -47,27 +47,51 @@ sites:
     aoi_where_clause: "MineSite='ER'"
     failover_share: "//prod-server/FMS_Landing/ER/snippet"
 
-  TG:
+  SF:
+    source_type: modular
+    landing_zone: "//server/GIP/FMS_Landing/SF/csv"
+    z_adjustment: 0.0
+    modular_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
+    aoi_where_clause: "MineSite='SF'"
+    failover_share: ""
+    # Positional column indices in the Modular CSV (0-based).
+    # Adjust these to match the actual SF CSV column layout.
+    csv_col_x: 1
+    csv_col_y: 2
+    csv_col_z: 3
+    csv_col_timestamp: 4
+
+  YND:
     source_type: minestar
-    landing_zone: "//server/GIP/FMS_Landing/TG/snippet"
+    landing_zone: "//server/GIP/FMS_Landing/YND/snippet"
     z_adjustment: 0.0
     input_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
-    aoi_where_clause: "MineSite='TG'"
+    aoi_where_clause: "MineSite='YND'"
     failover_share: ""
 
   JB:
     source_type: modular
     landing_zone: "//server/GIP/FMS_Landing/JB/csv"
+    z_adjustment: 0.0
     modular_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
     aoi_where_clause: "MineSite='JB'"
     failover_share: ""
+    csv_col_x: 1
+    csv_col_y: 2
+    csv_col_z: 3
+    csv_col_timestamp: 4
 
-  NM:
+  NWW:
     source_type: modular
-    landing_zone: "//server/GIP/FMS_Landing/NM/csv"
+    landing_zone: "//server/GIP/FMS_Landing/NWW/csv"
+    z_adjustment: 0.0
     modular_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
-    aoi_where_clause: "MineSite='NM'"
+    aoi_where_clause: "MineSite='NWW'"
     failover_share: ""
+    csv_col_x: 1
+    csv_col_y: 2
+    csv_col_z: 3
+    csv_col_timestamp: 4
 
   MAC:
     source_type: minestar
@@ -86,13 +110,10 @@ processing:
   min_neighbours: 3           # Min grid neighbours to retain a point (reference default)
   despike: true
   decimal_digits: 2           # Decimal places to round XYZ coordinates
-  grid_size: 2                # Grid cell size in metres (used for despike neighbour lookup)
+  grid_size: 2.0              # Grid cell size in metres (used for despike neighbour lookup)
 
   # Coordinate systems — paths to .prj files
   output_spatial_ref: "//server/FMS/projection/GDA2020_MGA_Zone_50.prj"
-
-  # Raster generation
-  grid_size: 2.0                   # Cell size in metres
 
   # ArcGIS feature class path for AOI polygon
   aoi_feature_class: "//server/FMS/GDB/reference.gdb/FMS_AOI"
