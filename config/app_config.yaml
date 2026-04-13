@@ -83,8 +83,10 @@ sites:
 processing:
   # Z filter
   max_z: 4000.0
-  min_neighbours: 2
+  min_neighbours: 3           # Min grid neighbours to retain a point (reference default)
   despike: true
+  decimal_digits: 2           # Decimal places to round XYZ coordinates
+  grid_size: 2                # Grid cell size in metres (used for despike neighbour lookup)
 
   # Coordinate systems — paths to .prj files
   output_spatial_ref: "//server/FMS/projection/GDA2020_MGA_Zone_50.prj"
