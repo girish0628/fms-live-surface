@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Config (sensitive)
+config/secrets.yaml
+config/*.prod.yaml
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ArcGIS / GDB
+*.lock
+*.gdb-journal
+*.gdb/
+
+# FMS scratch/staging data (do not commit)
+scratch/
+staging/
+
+# Temporary
+*.tmp
+*.bak
+*~

@@ -1,0 +1,16 @@
+# FMS Live Surface — Production Dependencies
+
+# Core
+pyyaml>=6.0.1
+
+# GIS Libraries
+# arcpy is bundled with ArcGIS Pro — do not install via pip.
+# arcgis>=2.3.0 may be used for REST API calls if arcpy is unavailable.
+arcgis>=2.3.0
+
+# Coordinate system utilities (arcpy-independent reprojection where needed)
+pyproj>=3.6.0
+
+# Geospatial I/O (reading/writing shapefiles, GeoJSON)
+shapely>=2.0.0
+fiona>=1.9.0

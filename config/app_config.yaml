@@ -1,0 +1,124 @@
+# FMS Live Surface — Application Configuration
+# Update paths to match your environment before running.
+
+environment: DEV
+
+# ------------------------------------------------------------------
+# File system paths
+# ------------------------------------------------------------------
+paths:
+  # GIP landing zone root — sub-folders per site are added by GIP
+  landing_zone_root: "//server/GIP/FMS_Landing"
+
+  # Staging folder for intermediate CSV + JSON config
+  staging_folder: "//server/FMS/Staging"
+
+  # Scratch file geodatabase for arcpy intermediate datasets
+  scratch_gdb: "//server/FMS/Scratch/fms_scratch.gdb"
+
+  # FMS output root — raster/boundary written here for publishing solution
+  output_root: "//server/FMS_Output"
+
+  # Nightly archive destination
+  archive_root: "//server/FMS/Archive"
+
+# ------------------------------------------------------------------
+# Mine site configurations
+# source_type: "minestar" | "modular" | "both"
+# z_adjustment: ADPH → AHD datum shift (metres)
+# input_spatial_ref: path to .prj file for site input data CRS
+# aoi_where_clause: SQL filter applied to the AOI feature class
+# failover_share: PROD share to copy from when GIP delivery is stale
+# ------------------------------------------------------------------
+sites:
+  WB:
+    source_type: minestar
+    landing_zone: "//server/GIP/FMS_Landing/WB/snippet"
+    z_adjustment: 3.155
+    input_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
+    aoi_where_clause: "MineSite='WB'"
+    failover_share: "//prod-server/FMS_Landing/WB/snippet"
+
+  ER:
+    source_type: minestar
+    landing_zone: "//server/GIP/FMS_Landing/ER/snippet"
+    z_adjustment: 3.155
+    input_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
+    aoi_where_clause: "MineSite='ER'"
+    failover_share: "//prod-server/FMS_Landing/ER/snippet"
+
+  TG:
+    source_type: minestar
+    landing_zone: "//server/GIP/FMS_Landing/TG/snippet"
+    z_adjustment: 0.0
+    input_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
+    aoi_where_clause: "MineSite='TG'"
+    failover_share: ""
+
+  JB:
+    source_type: modular
+    landing_zone: "//server/GIP/FMS_Landing/JB/csv"
+    modular_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
+    aoi_where_clause: "MineSite='JB'"
+    failover_share: ""
+
+  NM:
+    source_type: modular
+    landing_zone: "//server/GIP/FMS_Landing/NM/csv"
+    modular_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
+    aoi_where_clause: "MineSite='NM'"
+    failover_share: ""
+
+# ------------------------------------------------------------------
+# Processing parameters (applied to all sites unless overridden above)
+# ------------------------------------------------------------------
+processing:
+  # Z filter
+  max_z: 4000.0
+  min_neighbours: 2
+  despike: true
+
+  # Coordinate systems — paths to .prj files
+  output_spatial_ref: "//server/FMS/projection/GDA2020_MGA_Zone_50.prj"
+
+  # Raster generation
+  grid_size: 2.0                   # Cell size in metres
+
+  # ArcGIS feature class path for AOI polygon
+  aoi_feature_class: "//server/FMS/GDB/reference.gdb/FMS_AOI"
+
+  # Road-buffer exclusion polygon (MTD_Live_RoadsBuffered)
+  exclusion_fc: "//server/MTD/GDB/mtd_reference.gdb/MTD_Live_RoadsBuffered"
+
+  # Monitoring
+  monitoring_threshold_minutes: 10
+
+# ------------------------------------------------------------------
+# Publishing solution integration
+# ------------------------------------------------------------------
+publishing:
+  # "file_trigger" (Option B) or "direct_api" (Option A)
+  integration_mode: file_trigger
+
+  # Direct API: dotted Python path to the publish function
+  # e.g. "mtd.publishing.mosaic_publisher.publish_to_mosaic"
+  api_module: ""
+  api_timeout: 300
+
+  # File trigger: polling settings
+  # poll_timeout: 0 = fire-and-forget (FMS job does not wait)
+  poll_interval: 30
+  poll_timeout: 0
+
+# ------------------------------------------------------------------
+# Output management
+# ------------------------------------------------------------------
+output:
+  retention_hours: 48              # Delete output folders older than this
+
+# ------------------------------------------------------------------
+# Monitoring and alerting
+# ------------------------------------------------------------------
+monitoring:
+  alert_email: "gis-alerts@waio.bhp.com"
+  smtp_host: "mail.waio.bhp.com"
