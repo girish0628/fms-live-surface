@@ -120,6 +120,33 @@ class RasterGenerationService:
                 # Step 1: CSV → 3D Feature Class
                 # ----------------------------------------------------------------
                 logger.info("Step 1: CSV → 3D Feature Class")
+
+                # ArcPy reads all CSV columns as TEXT by default.
+                # A schema.ini file in the same directory forces numeric types
+                # so XYTableToPoint does not raise ERROR 003911.
+                csv_path_obj = Path(self.csv_path)
+                schema_ini = csv_path_obj.parent / "schema.ini"
+                schema_ini.write_text(
+                    f"[{csv_path_obj.name}]\n"
+                    f"ColNameHeader=True\n"
+                    f"Col1={self.x_field} Float\n"
+                    f"Col2={self.y_field} Float\n"
+                    f"Col3={self.z_field} Float\n"
+                    f"Col4=TIMESTAMP Long\n",
+                    encoding="utf-8",
+                )
+                logger.debug("schema.ini written: %s", schema_ini)
+
+                # Fail fast if the CSV is empty — avoids the cryptic
+                # ERROR 999999 / "dataset type cannot be recognized" from CreateTin.
+                csv_row_count = sum(1 for _ in open(self.csv_path, encoding="utf-8")) - 1
+                logger.info("CSV row count: %d", csv_row_count)
+                if csv_row_count == 0:
+                    raise RasterGenerationError(
+                        f"CSV has no data rows: {self.csv_path}. "
+                        "Snippet conversion produced no valid points for this site/run."
+                    )
+
                 arcpy.management.XYTableToPoint(
                     in_table=self.csv_path,
                     out_feature_class=fc_name,
@@ -130,6 +157,12 @@ class RasterGenerationService:
                 )
                 point_count = int(arcpy.management.GetCount(fc_name).getOutput(0))
                 logger.info("Created feature class with %d points", point_count)
+                if point_count == 0:
+                    raise RasterGenerationError(
+                        f"XYTableToPoint produced 0 points from {self.csv_path}. "
+                        f"CSV had {csv_row_count} rows — check that {self.x_field}/{self.y_field}/{self.z_field} "
+                        "columns are numeric and that the spatial reference matches the data."
+                    )
 
                 # ----------------------------------------------------------------
                 # Step 2: 3D Feature Class → TIN
