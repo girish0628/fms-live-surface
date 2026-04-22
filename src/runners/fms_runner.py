@@ -27,11 +27,10 @@ from typing import Any
 from src.core.config_loader import ConfigLoader, get_config_value
 from src.core.logger import get_logger, setup_logging
 from src.services.archive_service import ArchiveService
+from src.services.fms_pipeline_service import process_fms_pipeline
 from src.services.modular_csv_service import ModularCsvService
 from src.services.monitoring_service import MonitoringService
-from src.services.output_handler_service import OutputHandlerService
 from src.services.publishing_service import PublishingService
-from src.services.raster_generation_service import RasterGenerationService
 from src.services.snippet_conversion_service import SnippetConversionService
 
 
@@ -142,44 +141,31 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
         raise RuntimeError(f"File conversion failed for site {site}")
 
     csv_path = conversion_result["csv_path"]
-    output_dir_staging = conversion_result["output_dir"]
 
     # ------------------------------------------------------------------
-    # Step 2: Raster + boundary generation (arcpy)
+    # Step 2: FMS Pipeline — raster + boundary + output folder structure
     # ------------------------------------------------------------------
-    logger.info("--- Step 2: Raster generation ---")
-    raster_svc = RasterGenerationService(
-        site=site,
-        csv_path=csv_path,
-        output_dir=output_dir_staging,
-        scratch_gdb=scratch_gdb,
-        spatial_ref_prj=processing_cfg.get("output_spatial_ref", ""),
-        cell_size=float(processing_cfg.get("grid_size", 2.0)),
-        exclusion_fc=processing_cfg.get("exclusion_fc", ""),
-    )
-    raster_result = raster_svc.generate()
-    logger.info("Raster generation result: %s", raster_result["status"])
-
-    # ------------------------------------------------------------------
-    # Step 3: Output folder management
-    # ------------------------------------------------------------------
-    logger.info("--- Step 3: Output handler ---")
-    processing_meta: dict[str, Any] = {
-        "cell_size": raster_result.get("cell_size"),
-        "sourceFiles": conversion_result,
-        "processing": processing_cfg,
+    logger.info("--- Step 2: FMS Pipeline (raster + boundary + output) ---")
+    fms_config: dict[str, Any] = {
+        "cellSize": int(processing_cfg.get("grid_size", 1)),
+        "snapRaster": processing_cfg.get("snap_raster", ""),
+        "inputSpatialRef": site_cfg.get("input_spatial_ref", ""),
+        "outputSpatialRef": processing_cfg.get("output_spatial_ref", ""),
+        "aoiFeatureClass": processing_cfg.get("aoi_feature_class", ""),
+        "aoiWhereClause": site_cfg.get("aoi_where_clause", f"MineSite='{site}'"),
+        "useAOI": bool(processing_cfg.get("aoi_feature_class", "")),
+        "averagePointSpacing": float(processing_cfg.get("average_point_spacing", 1.0)),
+        "tinDelineateValue": float(processing_cfg.get("tin_delineate_value", 10.0)),
+        "profile": "Elevation_FMS_Minestar_CSV",
     }
-    output_svc = OutputHandlerService(
-        site=site,
-        output_root=output_root,
-        raster_path=raster_result["raster_path"],
-        boundary_path=raster_result["boundary_path"],
-        processing_metadata=processing_meta,
-        retention_hours=int(get_config_value(cfg, "output.retention_hours", 48)),
+    pipeline_result = process_fms_pipeline(
+        input_csv=csv_path,
+        output_base_folder=output_root,
+        site_name=site,
+        config=fms_config,
     )
-    output_result = output_svc.publish_outputs()
-    output_svc.cleanup_old_outputs()
-    logger.info("Output handler result: %s", output_result["status"])
+    logger.info("FMS Pipeline result: %s", pipeline_result["status"])
+    output_result = {"output_dir": pipeline_result["output_folder"]}
 
     # ------------------------------------------------------------------
     # Step 4: Handoff to publishing solution
