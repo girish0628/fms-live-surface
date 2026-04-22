@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import traceback
 import uuid
 from datetime import datetime
@@ -136,6 +135,52 @@ def _get_aoi(aoi_fc: str, aoi_where: str):
     if aoi_geom is None:
         logger.warning("AOI query returned no features — skipping clip")
     return aoi_geom
+
+
+# ---------------------------------------------------------------------------
+# CSV copy with configurable decimal rounding on X, Y, Z
+# ---------------------------------------------------------------------------
+
+def _write_csv_rounded(src: str, dst: str, decimal_places: int) -> int:
+    """
+    Copy *src* CSV to *dst* with X, Y, Z values rounded to *decimal_places*.
+
+    Expects a header row containing X, Y, Z column names (case-insensitive).
+    Any extra columns (e.g. TIMESTAMP) are preserved unchanged.
+    Returns the number of data rows written.
+    """
+    import csv
+
+    fmt = f"{{:.{decimal_places}f}}"
+
+    with open(src, newline="", encoding="utf-8") as fin, \
+         open(dst, "w", newline="", encoding="utf-8") as fout:
+
+        reader = csv.DictReader(fin)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {src}")
+
+        # Identify X / Y / Z columns (case-insensitive)
+        header = list(reader.fieldnames)
+        upper = [h.upper() for h in header]
+        xyz_indices = {upper.index(c) for c in ("X", "Y", "Z") if c in upper}
+        xyz_names = {header[i] for i in xyz_indices}
+
+        writer = csv.DictWriter(fout, fieldnames=header, lineterminator="\n")
+        writer.writeheader()
+
+        rows_written = 0
+        for row in reader:
+            for col in xyz_names:
+                if row[col].strip():
+                    row[col] = fmt.format(float(row[col]))
+            writer.writerow(row)
+            rows_written += 1
+
+    logger.debug(
+        "CSV rounded to %d dp — %d rows written: %s", decimal_places, rows_written, dst
+    )
+    return rows_written
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +363,7 @@ def process_fms_pipeline(
         Key                   Type    Default   Description
         ──────────────────────────────────────────────────────────────────
         cellSize              int     1         Raster cell size (metres)
+        decimalPlaces         int     2         Decimal places for X, Y, Z in Source CSV
         snapRaster            str     ""        Optional snap raster path
         inputSpatialRef       str     ""        Input CRS (.prj path or WKT)
         outputSpatialRef      str     ""        Output CRS (.prj path or WKT)
@@ -379,8 +425,9 @@ def process_fms_pipeline(
         # ----------------------------------------------------------------
         # 2. Copy + rename CSV into Source/
         # ----------------------------------------------------------------
-        shutil.copy2(input_csv, csv_dest)
-        logger.info("CSV → Source: %s", csv_dest)
+        decimal_places = int(config.get("decimalPlaces", 2))
+        rows = _write_csv_rounded(input_csv, csv_dest, decimal_places)
+        logger.info("CSV → Source (%d dp, %d rows): %s", decimal_places, rows, csv_dest)
 
         # ----------------------------------------------------------------
         # 3. Create File GDB
