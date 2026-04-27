@@ -1,12 +1,18 @@
 """
 Publishing integration service.
 
-Hands off the processed FMS outputs (raster + boundary) to the existing
-enterprise publishing solution.
+Hands off the processed FMS outputs (raster + boundary) to the downstream
+publishing solution.
 
-Supports two integration modes (configured via ``integration_mode``):
+Supports three integration modes (configured via ``integration_mode``):
 
-  file_trigger (default)
+  fme_webhook (default)
+    POSTs to an FME Server job submitter endpoint.  The FME token is read
+    from the OS environment variable named by ``fme_token_env_var``
+    (default ``FME-TOKEN``).  Call this from ``fms_finalize_runner`` after
+    all per-site outputs are written and boundaries have been merged.
+
+  file_trigger
     FMS writes outputs and a ready.flag; the publishing solution polls for
     the flag.  This service verifies the flag exists and optionally waits
     for a completion signal.
@@ -14,15 +20,12 @@ Supports two integration modes (configured via ``integration_mode``):
   direct_api
     FMS calls the existing publishing solution directly via a Python API
     (function call or REST endpoint).  Provides immediate feedback.
-
-The SDE mosaic dataset operations (AddRastersToMosaicDataset etc.) are
-performed by the *existing publishing solution*, not this service.
 """
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,32 +36,35 @@ from src.core.logger import get_logger
 @dataclass(frozen=True)
 class PublishingService:
     """
-    Trigger the existing enterprise publishing solution.
+    Trigger the downstream publishing solution.
 
     Parameters
     ----------
     site : str
-        Mine site code (WB, ER, TG, JB, NM).
+        Mine site code, or ``"ALL"`` when called from the finalize runner.
     output_dir : str
-        Timestamped output folder written by OutputHandlerService.
+        The shared ``FMS_<timestamp>`` output folder.
     integration_mode : str
-        ``"file_trigger"`` or ``"direct_api"``.
+        ``"fme_webhook"``, ``"file_trigger"``, or ``"direct_api"``.
+    fme_webhook_url : str
+        Full URL of the FME Server job submitter endpoint.
+    fme_token_env_var : str
+        Name of the OS environment variable holding the FME token.
     publishing_api_module : str
-        Dotted Python module path of the existing publishing solution's
-        entry point (used when *integration_mode* is ``"direct_api"``).
-        E.g. ``"mtd.publishing.publish_to_mosaic"``.
+        Dotted Python module path used when *integration_mode* is ``"direct_api"``.
     api_timeout : int
-        Seconds to wait for the direct API call to complete.
+        Seconds to wait for the API / webhook call.
     poll_interval : int
-        Seconds between polls when waiting for a completion signal file
-        (``done.flag``) in file-trigger mode.
+        Seconds between polls in file-trigger mode.
     poll_timeout : int
-        Maximum seconds to wait for ``done.flag`` before raising an error.
+        Maximum seconds to wait for ``done.flag`` in file-trigger mode.
     """
 
     site: str
     output_dir: str
-    integration_mode: str = "file_trigger"
+    integration_mode: str = "fme_webhook"
+    fme_webhook_url: str = ""
+    fme_token_env_var: str = "FME-TOKEN"
     publishing_api_module: str = ""
     api_timeout: int = 300
     poll_interval: int = 30
@@ -83,15 +89,64 @@ class PublishingService:
             "Publishing trigger — site: %s  mode: %s", self.site, self.integration_mode
         )
 
-        if self.integration_mode == "file_trigger":
+        if self.integration_mode == "fme_webhook":
+            return self._fme_webhook()
+        elif self.integration_mode == "file_trigger":
             return self._file_trigger()
         elif self.integration_mode == "direct_api":
             return self._direct_api()
         else:
             raise PublishingError(
                 f"Unknown integration_mode: {self.integration_mode!r}. "
-                "Expected 'file_trigger' or 'direct_api'."
+                "Expected 'fme_webhook', 'file_trigger', or 'direct_api'."
             )
+
+    # ------------------------------------------------------------------
+    # FME webhook
+    # ------------------------------------------------------------------
+
+    def _fme_webhook(self) -> dict[str, Any]:
+        """POST to the FME Server job submitter endpoint."""
+        import os
+        import urllib.error
+        import urllib.request
+
+        logger = get_logger(__name__)
+
+        token = os.environ.get(self.fme_token_env_var, "")
+        if not token:
+            raise PublishingError(
+                f"FME token not found — set the '{self.fme_token_env_var}' environment variable."
+            )
+        if not self.fme_webhook_url:
+            raise PublishingError(
+                "fme_webhook_url must be set in app_config.yaml when integration_mode='fme_webhook'."
+            )
+
+        payload = json.dumps({
+            "output_dir": self.output_dir,
+            "site": self.site,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            self.fme_webhook_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"fmetoken token={token}",
+                "Content-Type": "application/json",
+            },
+        )
+        logger.info("Calling FME webhook: %s", self.fme_webhook_url)
+        try:
+            with urllib.request.urlopen(req, timeout=self.api_timeout) as resp:
+                logger.info("FME webhook response: HTTP %s", resp.status)
+        except urllib.error.HTTPError as exc:
+            raise PublishingError(f"FME webhook returned HTTP {exc.code}: {exc.reason}") from exc
+        except Exception as exc:
+            raise PublishingError(f"FME webhook call failed: {exc}") from exc
+
+        return self._success_result("fme_webhook", published=True)
 
     # ------------------------------------------------------------------
     # Option B: File-based trigger

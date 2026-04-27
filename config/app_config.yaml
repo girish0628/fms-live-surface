@@ -128,8 +128,15 @@ processing:
 # Publishing solution integration
 # ------------------------------------------------------------------
 publishing:
-  # "file_trigger" (Option B) or "direct_api" (Option A)
-  integration_mode: file_trigger
+  # "fme_webhook" | "file_trigger" | "direct_api"
+  # fme_webhook: boundary merge + FME REST call handled by fms_finalize_runner
+  integration_mode: fme_webhook
+
+  # FME webhook: URL of the FME Server job submitter endpoint
+  fme_webhook_url: "https://your-fme-server/fmejobsubmitter/WORKSPACE"
+  # Name of the OS environment variable holding the FME token
+  fme_token_env_var: "FME-TOKEN"
+  fme_timeout: 300
 
   # Direct API: dotted Python path to the publish function
   # e.g. "mtd.publishing.mosaic_publisher.publish_to_mosaic"

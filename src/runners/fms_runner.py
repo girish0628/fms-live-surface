@@ -21,7 +21,10 @@ Usage (Jenkins):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from src.core.config_loader import ConfigLoader, get_config_value
@@ -67,6 +70,14 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
     scratch_gdb = paths_cfg.get("scratch_gdb", "")
     source_type = site_cfg.get("source_type", "minestar")  # "minestar" | "modular" | "both"
 
+    # Shared run timestamp — all parallel site processes use the same value so
+    # they write into a single FMS_<timestamp> output folder.
+    run_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
+    logger.info("Run timestamp: %s", run_timestamp)
+
+    # Staging subfolder mirrors the output folder structure
+    staging_run_folder = str(Path(staging_folder) / f"FMS_{run_timestamp}")
+
     # ------------------------------------------------------------------
     # Step 0: Monitoring check
     # ------------------------------------------------------------------
@@ -92,7 +103,7 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
         snippet_svc = SnippetConversionService(
             site=site,
             input_folder=landing_zone,
-            output_folder=staging_folder,
+            output_folder=staging_run_folder,
             z_adjustment=site_cfg.get("z_adjustment", processing_cfg.get("z_adjustment", 3.155)),
             min_neighbours=processing_cfg.get("min_neighbours", 3),
             max_z=processing_cfg.get("max_z", 4000.0),
@@ -115,7 +126,7 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
         modular_svc = ModularCsvService(
             site=site,
             input_folder=landing_zone,
-            output_folder=staging_folder,
+            output_folder=staging_run_folder,
             z_adjustment=site_cfg.get("z_adjustment", 0.0),
             min_neighbours=processing_cfg.get("min_neighbours", 3),
             max_z=processing_cfg.get("max_z", 4000.0),
@@ -163,25 +174,34 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
         output_base_folder=output_root,
         site_name=site,
         config=fms_config,
+        run_timestamp=run_timestamp,
     )
     logger.info("FMS Pipeline result: %s", pipeline_result["status"])
-    output_result = {"output_dir": pipeline_result["output_folder"]}
 
     # ------------------------------------------------------------------
-    # Step 4: Handoff to publishing solution
+    # Step 4: Publishing handoff
+    # fme_webhook mode: publishing is deferred to fms_finalize_runner,
+    # which merges all per-site boundaries first then calls the webhook.
+    # file_trigger / direct_api modes: trigger per-site as before.
     # ------------------------------------------------------------------
-    logger.info("--- Step 4: Publishing handoff ---")
-    pub_svc = PublishingService(
-        site=site,
-        output_dir=output_result["output_dir"],
-        integration_mode=publishing_cfg.get("integration_mode", "file_trigger"),
-        publishing_api_module=publishing_cfg.get("api_module", ""),
-        api_timeout=int(publishing_cfg.get("api_timeout", 300)),
-        poll_interval=int(publishing_cfg.get("poll_interval", 30)),
-        poll_timeout=int(publishing_cfg.get("poll_timeout", 0)),  # 0 = fire-and-forget
-    )
-    pub_result = pub_svc.trigger()
-    logger.info("Publishing result: %s", pub_result["status"])
+    integration_mode = publishing_cfg.get("integration_mode", "fme_webhook")
+    if integration_mode == "fme_webhook":
+        logger.info(
+            "--- Step 4: Publishing deferred to fms_finalize_runner (fme_webhook mode) ---"
+        )
+    else:
+        logger.info("--- Step 4: Publishing handoff (%s) ---", integration_mode)
+        pub_svc = PublishingService(
+            site=site,
+            output_dir=pipeline_result["output_folder"],
+            integration_mode=integration_mode,
+            publishing_api_module=publishing_cfg.get("api_module", ""),
+            api_timeout=int(publishing_cfg.get("api_timeout", 300)),
+            poll_interval=int(publishing_cfg.get("poll_interval", 30)),
+            poll_timeout=int(publishing_cfg.get("poll_timeout", 0)),
+        )
+        pub_result = pub_svc.trigger()
+        logger.info("Publishing result: %s", pub_result["status"])
 
     logger.info("=" * 60)
     logger.info("FMS Live Surface Workflow COMPLETE — site: %s", site)

@@ -6,22 +6,21 @@ No external custom dependencies — uses standard Python + arcpy only.
 
 Pipeline:
     CSV (XYZ) → 3D Feature Class → TIN → Raster (GeoTIFF)
-    → Boundary polygon (RasterToPolygon + Dissolve) → File GDB
+    → Boundary polygon (RasterToPolygon + Dissolve) → Shapefile
     → ProcessData.json
 
-Output folder layout (created under output_base_folder):
-    <YYYYmmddHHMMSS>_FMS_<SITENAME>/
-    ├── FMS_<SITENAME>.gdb/
-    │   └── Boundary          ← dissolved polygon feature class
+Output folder layout (shared across all sites for one run):
+    FMS_<run_timestamp>/                          ← shared by all sites
     ├── Source/
-    │   └── <YYYYmmddHHMMSS>_FMS_<SITENAME>.csv
-    ├── <YYYYmmddHHMMSS>_FMS_<SITENAME>.tif
-    └── ProcessData.json
+    │   ├── FMS_<run_timestamp>_<SITE>.csv        ← one per site
+    │   └── ...
+    ├── FMS_<run_timestamp>_<SITE>.tif            ← one per site
+    ├── FMS_<run_timestamp>_<SITE>_boundary.shp   ← per-site (merged by finalize runner)
+    └── FMS_<run_timestamp>_<SITE>_ProcessData.json
 
-Jenkins usage:
-    Each site is a separate process invocation — parallel execution is safe
-    because every run generates a unique timestamped output folder and uses
-    random UUIDs for all intermediate IN_MEMORY / scratchFolder datasets.
+The run_timestamp is read from the FMS_RUN_TIMESTAMP environment variable so
+that all parallel Jenkins site processes write into the same shared folder.
+If the variable is not set a timestamp is generated from the current clock.
 """
 from __future__ import annotations
 
@@ -255,13 +254,12 @@ def _generate_raster(
 
 
 # ---------------------------------------------------------------------------
-# Boundary generation: Raster → Polygon → Dissolve → File GDB FC
+# Boundary generation: Raster → Polygon → Dissolve → Shapefile
 # ---------------------------------------------------------------------------
 
-def _generate_boundary(input_raster: str, output_fc: str, item_name: str) -> None:
+def _generate_boundary(input_raster: str, output_shp: str, item_name: str) -> None:
     """
-    Convert the valid raster data area to a dissolved boundary polygon
-    and store it inside the output File GDB.
+    Convert the valid raster data area to a dissolved boundary shapefile.
 
     Uses the XOR-to-zero technique (raster ^ raster = integer 0 mask)
     so that RasterToPolygon captures exactly the footprint of non-NoData cells.
@@ -293,14 +291,10 @@ def _generate_boundary(input_raster: str, output_fc: str, item_name: str) -> Non
         arcpy.CalculateField_management(
             dissolved_fc, "Name", f"'{item_name}'", "PYTHON3"
         )
-        if arcpy.Exists(output_fc):
-            arcpy.Delete_management(output_fc)
-        arcpy.FeatureClassToFeatureClass_conversion(
-            dissolved_fc,
-            os.path.dirname(output_fc),
-            os.path.basename(output_fc),
-        )
-        logger.info("Boundary FC written: %s", output_fc)
+        if arcpy.Exists(output_shp):
+            arcpy.Delete_management(output_shp)
+        arcpy.CopyFeatures_management(dissolved_fc, output_shp)
+        logger.info("Boundary SHP written: %s", output_shp)
     finally:
         try:
             if arcpy.Exists(dissolved_fc):
@@ -345,6 +339,7 @@ def process_fms_pipeline(
     output_base_folder: str,
     site_name: str,
     config: dict[str, Any],
+    run_timestamp: str | None = None,
 ) -> dict[str, Any]:
     """
     Run the complete FMS elevation pipeline for one site.
@@ -354,9 +349,9 @@ def process_fms_pipeline(
     input_csv : str
         Path to the MGA50-projected XYZ CSV (X, Y, Z [, TIMESTAMP] columns).
     output_base_folder : str
-        Root directory where the timestamped output folder is created.
+        Root directory where the shared ``FMS_<run_timestamp>`` folder is created.
     site_name : str
-        Site code, e.g. ``YAN``, ``MAC``, ``JBAH``.
+        Site code, e.g. ``WB``, ``MAC``, ``JB``.
     config : dict
         Processing parameters:
 
@@ -373,6 +368,11 @@ def process_fms_pipeline(
         averagePointSpacing   float   1.0       ASCII3DToFeatureClass spacing
         tinDelineateValue     float   10.0      TIN delineation max edge length
         profile               str     "Elevation_FMS_Minestar_CSV"
+    run_timestamp : str or None
+        Timestamp string used in folder and file names.  If *None*, the value
+        is read from the ``FMS_RUN_TIMESTAMP`` environment variable, then falls
+        back to the current clock (``YYYYmmddHHMMSS``).  Set this via Jenkins
+        before launching parallel site stages so all sites share one folder.
 
     Returns
     -------
@@ -396,19 +396,20 @@ def process_fms_pipeline(
             "arcpy is not available — ArcGIS Pro must be installed and licensed."
         ) from exc
 
-    now = datetime.now()
-    dt_str = now.strftime("%Y%m%d%H%M%S")
-    acq_date = now.strftime("%Y-%m-%d %H:%M:%S")
-    group_name = f"{dt_str}_FMS_{site_name}"
+    if run_timestamp is None:
+        run_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
 
-    output_folder = Path(output_base_folder) / group_name
+    now = datetime.now()
+    acq_date = now.strftime("%Y-%m-%d %H:%M:%S")
+    group_name = f"FMS_{run_timestamp}_{site_name}"
+
+    # All sites for the same run share a single output folder
+    output_folder = Path(output_base_folder) / f"FMS_{run_timestamp}"
     source_folder = output_folder / "Source"
-    gdb_name = f"FMS_{site_name}.gdb"
-    gdb_path = str(output_folder / gdb_name)
-    raster_path = str(output_folder / f"{group_name}.tif")
-    csv_dest = str(source_folder / f"{group_name}.csv")
-    boundary_fc = os.path.join(gdb_path, "Boundary")
-    json_path = str(output_folder / "ProcessData.json")
+    raster_path = str(output_folder / f"FMS_{run_timestamp}_{site_name}.tif")
+    boundary_shp = str(output_folder / f"FMS_{run_timestamp}_{site_name}_boundary.shp")
+    csv_dest = str(source_folder / f"FMS_{run_timestamp}_{site_name}.csv")
+    json_path = str(output_folder / f"FMS_{run_timestamp}_{site_name}_ProcessData.json")
 
     logger.info("=" * 60)
     logger.info("FMS Pipeline — site: %s  group: %s", site_name, group_name)
@@ -430,17 +431,9 @@ def process_fms_pipeline(
         logger.info("CSV → Source (%d dp, %d rows): %s", decimal_places, rows, csv_dest)
 
         # ----------------------------------------------------------------
-        # 3. Create File GDB
+        # 3. Resolve spatial references and AOI
         # ----------------------------------------------------------------
         arcpy.env.overwriteOutput = True
-        if arcpy.Exists(gdb_path):
-            arcpy.Delete_management(gdb_path)
-        arcpy.CreateFileGDB_management(str(output_folder), gdb_name)
-        logger.info("File GDB: %s", gdb_path)
-
-        # ----------------------------------------------------------------
-        # 4. Resolve spatial references and AOI
-        # ----------------------------------------------------------------
         input_sr = _resolve_sr(config.get("inputSpatialRef"))
         output_sr = _resolve_sr(config.get("outputSpatialRef"))
 
@@ -455,7 +448,7 @@ def process_fms_pipeline(
             arcpy.env.snapRaster = config["snapRaster"]
 
         # ----------------------------------------------------------------
-        # 5. Raster generation (CSV → TIN → GeoTIFF)
+        # 4. Raster generation (CSV → TIN → GeoTIFF)
         # ----------------------------------------------------------------
         _checkout_extensions()
         try:
@@ -473,12 +466,12 @@ def process_fms_pipeline(
             logger.info("Raster: %s", raster_path)
 
             # ----------------------------------------------------------------
-            # 6. Boundary polygon inside GDB
+            # 5. Boundary polygon → shapefile
             # ----------------------------------------------------------------
             logger.info("--- Boundary generation ---")
             _generate_boundary(
                 input_raster=raster_path,
-                output_fc=boundary_fc,
+                output_shp=boundary_shp,
                 item_name=group_name,
             )
 
@@ -486,7 +479,7 @@ def process_fms_pipeline(
             _checkin_extensions()
 
         # ----------------------------------------------------------------
-        # 7. ProcessData.json
+        # 6. ProcessData.json
         # ----------------------------------------------------------------
         _write_process_data_json(
             json_path=json_path,
@@ -502,7 +495,7 @@ def process_fms_pipeline(
             "group_name": group_name,
             "output_folder": str(output_folder),
             "raster_path": raster_path,
-            "boundary_path": boundary_fc,
+            "boundary_path": boundary_shp,
             "json_path": json_path,
         }
 
@@ -519,6 +512,7 @@ def batch_process_fms(
     jobs: list[tuple[str, str]],
     output_base_folder: str,
     config: dict[str, Any],
+    run_timestamp: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run process_fms_pipeline sequentially for a list of (csv_path, site_name) jobs.
@@ -540,7 +534,7 @@ def batch_process_fms(
     for csv_path, site_name in jobs:
         logger.info("Batch job: site=%s  csv=%s", site_name, csv_path)
         try:
-            result = process_fms_pipeline(csv_path, output_base_folder, site_name, config)
+            result = process_fms_pipeline(csv_path, output_base_folder, site_name, config, run_timestamp)
         except Exception:  # noqa: BLE001
             result = {
                 "status": "FAILED",
