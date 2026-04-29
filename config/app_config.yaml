@@ -1,7 +1,7 @@
 # FMS Live Surface — Application Configuration
-# Update paths to match your environment before running.
-
-environment: DEV
+# Update paths and URLs to match your environment before deploying.
+# Sensitive values (FME token, Azure connection string) must be set as
+# OS environment variables — never store them in this file.
 
 # ------------------------------------------------------------------
 # File system paths
@@ -16,10 +16,13 @@ paths:
   # Scratch file geodatabase for arcpy intermediate datasets
   scratch_gdb: "//server/FMS/Scratch/fms_scratch.gdb"
 
-  # FMS output root — raster/boundary written here for publishing solution
+  # FMS hourly output root — raster/boundary written here per run
   output_root: "//server/FMS_Output"
 
-  # Nightly archive destination
+  # Daily merged TIFF output root (defaults to output_root if not set)
+  daily_output_root: "//server/FMS_Output/Daily"
+
+  # Nightly .snp archive destination (used by archive_runner.py)
   archive_root: "//server/FMS/Archive"
 
 # ------------------------------------------------------------------
@@ -54,8 +57,6 @@ sites:
     modular_spatial_ref: "//server/FMS/projection/GDA1994_MGA_Zone_50.prj"
     aoi_where_clause: "MineSite='SF'"
     failover_share: ""
-    # Positional column indices in the Modular CSV (0-based).
-    # Adjust these to match the actual SF CSV column layout.
     csv_col_x: 1
     csv_col_y: 2
     csv_col_z: 3
@@ -97,62 +98,105 @@ sites:
     source_type: minestar
     landing_zone: "//server/GIP/FMS_Landing/MAC/snippet"
     z_adjustment: 0.0
-    input_spatial_ref: "//waio/standardafs/GISAdmin/GPConfig/Projections/ProjectionFiles/Central Project Grid (CPG94).prj"
+    input_spatial_ref: "//server/FMS/projection/CentralProjectGrid_CPG94.prj"
     aoi_where_clause: "MineSite='MAC'"
     failover_share: ""
 
 # ------------------------------------------------------------------
-# Processing parameters (applied to all sites unless overridden above)
+# Processing parameters (shared across all sites unless overridden)
 # ------------------------------------------------------------------
 processing:
-  # Z filter
   max_z: 4000.0
-  min_neighbours: 3           # Min grid neighbours to retain a point (reference default)
+  min_neighbours: 3
   despike: true
-  decimal_digits: 2           # Decimal places to round XYZ coordinates
-  grid_size: 2.0              # Grid cell size in metres (used for despike neighbour lookup)
+  decimal_digits: 2
+  grid_size: 2.0              # Cell size in metres; also used as RESOLUTION in FME webhook
 
   # Coordinate systems — paths to .prj files
   output_spatial_ref: "//server/FMS/projection/GDA2020_MGA_Zone_50.prj"
 
+  # WKT string of the output spatial reference, passed to FME COORDINATE_SYSTEM
+  # and MosaicToNewRaster.  Leave empty to derive from the .prj file at runtime.
+  coordinate_system_wkt: ""
+
   # ArcGIS feature class path for AOI polygon
   aoi_feature_class: "//server/FMS/GDB/reference.gdb/FMS_AOI"
 
-  # Road-buffer exclusion polygon (MTD_Live_RoadsBuffered)
+  # Road-buffer exclusion polygon
   exclusion_fc: "//server/MTD/GDB/mtd_reference.gdb/MTD_Live_RoadsBuffered"
 
   # Monitoring
   monitoring_threshold_minutes: 10
 
 # ------------------------------------------------------------------
-# Publishing solution integration
+# FME Server webhook endpoints
+# The FME token must be set as an OS environment variable.
+# Never store the token value in this file.
 # ------------------------------------------------------------------
-publishing:
-  # "fme_webhook" | "file_trigger" | "direct_api"
-  # fme_webhook: boundary merge + FME REST call handled by fms_finalize_runner
-  integration_mode: fme_webhook
+fme:
+  # FME job submitter URL for INGEST operations (hourly + daily)
+  ingest_url: "https://your-fme-server/fmejobsubmitter/FMS_INGEST_WORKSPACE"
 
-  # FME webhook: URL of the FME Server job submitter endpoint
-  fme_webhook_url: "https://your-fme-server/fmejobsubmitter/WORKSPACE"
-  # Name of the OS environment variable holding the FME token
-  fme_token_env_var: "FME-TOKEN"
-  fme_timeout: 300
+  # FME job submitter URL for DELETE operations (daily cleanup)
+  delete_url: "https://your-fme-server/fmejobsubmitter/FMS_DELETE_WORKSPACE"
 
-  # Direct API: dotted Python path to the publish function
-  # e.g. "mtd.publishing.mosaic_publisher.publish_to_mosaic"
-  api_module: ""
-  api_timeout: 300
+  # Name of the OS env var holding the FME bearer token
+  token_env_var: "FME-TOKEN"
 
-  # File trigger: polling settings
-  # poll_timeout: 0 = fire-and-forget (FMS job does not wait)
-  poll_interval: 30
-  poll_timeout: 0
+  # HTTP timeout for each webhook POST (seconds)
+  timeout: 300
+
+  # Retry settings for transient server errors
+  max_retries: 3
+  retry_delay_seconds: 5.0
+
+  # Email address passed to FME as USER_EMAIL in all webhook calls
+  user_email: "gis-alerts@waio.bhp.com"
 
 # ------------------------------------------------------------------
-# Output management
+# MTD Mosaic Dataset — used by daily_cleanup_runner to identify
+# hourly surveys for deletion
+# ------------------------------------------------------------------
+mosaic:
+  # Full ArcGIS path to the mosaic dataset
+  dataset_path: "//server/MTD/GDB/mtd.gdb/FMS_Terrain_Mosaic"
+
+  # Field names in the mosaic dataset attribute table
+  survey_name_field: "Name"
+  site_field: "SITE"
+
+  # Value that identifies hourly surveys (must match what FME writes on INGEST)
+  hourly_site_value: "Hourly"
+
+# ------------------------------------------------------------------
+# Azure Blob Storage — weekly archival
+# Connection string must be set as an OS environment variable.
+# ------------------------------------------------------------------
+blob_storage:
+  # Name of the OS env var holding the Azure Storage connection string
+  connection_string_env_var: "AZURE_STORAGE_CONNECTION_STRING"
+
+  # Target Azure Blob container name
+  container_name: "fms-archive"
+
+  # Virtual folder prefix inside the container
+  prefix: "fms-live-surface/"
+
+# ------------------------------------------------------------------
+# Weekly cleanup settings
+# ------------------------------------------------------------------
+weekly:
+  # Archive and delete output folders older than this many days
+  output_retention_days: 7
+
+  # Delete staging intermediate files older than this many days (no blob upload)
+  staging_retention_days: 2
+
+# ------------------------------------------------------------------
+# Output management (hourly)
 # ------------------------------------------------------------------
 output:
-  retention_hours: 48              # Delete output folders older than this
+  retention_hours: 48              # Delete hourly output folders older than this
 
 # ------------------------------------------------------------------
 # Monitoring and alerting
@@ -160,3 +204,18 @@ output:
 monitoring:
   alert_email: "gis-alerts@waio.bhp.com"
   smtp_host: "mail.waio.bhp.com"
+
+# ------------------------------------------------------------------
+# Legacy publishing section (kept for backwards compatibility)
+# fme_webhook mode is now handled directly by fms_finalize_runner
+# via FmeWebhookClient — this section is no longer used for INGEST/DELETE.
+# ------------------------------------------------------------------
+publishing:
+  integration_mode: fme_webhook
+  fme_webhook_url: ""
+  fme_token_env_var: "FME-TOKEN"
+  fme_timeout: 300
+  api_module: ""
+  api_timeout: 300
+  poll_interval: 30
+  poll_timeout: 0

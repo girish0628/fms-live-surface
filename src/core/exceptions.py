@@ -44,3 +44,15 @@ class ArcPyExecutionError(ServiceExecutionError):
 
 class ValidationError(ServiceExecutionError):
     """Raised when data validation fails."""
+
+
+class DailyMergeError(ServiceExecutionError):
+    """Raised when daily TIFF mosaic merge fails."""
+
+
+class DailyCleanupError(ServiceExecutionError):
+    """Raised when daily mosaic dataset cleanup query or FME DELETE call fails."""
+
+
+class WeeklyCleanupError(ServiceExecutionError):
+    """Raised when weekly file-share cleanup or blob archival fails."""
