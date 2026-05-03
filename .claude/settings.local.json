@@ -3,7 +3,16 @@
     "allow": [
       "Bash(git push *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(Get-ChildItem -Path \"D:\\\\STUFF\\\\drillhole\\\\FMS\\\\fms-live-surface\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(Sort-Object FullName)",
+      "Bash(ConvertTo-Csv -NoTypeInformation)",
+      "Bash(Select-Object -Skip 1)",
+      "Bash(Remove-Item \"D:\\\\STUFF\\\\drillhole\\\\FMS\\\\fms-live-surface\\\\src\\\\services\\\\output_handler_service.py\" -Force)",
+      "Bash(Remove-Item \"D:\\\\STUFF\\\\drillhole\\\\FMS\\\\fms-live-surface\\\\tests\\\\test_services\\\\test_output_handler_service.py\" -Force)",
+      "Bash(Write-Output \"Deleted output_handler_service.py and its test\")",
+      "PowerShell(Remove-Item *)"
     ]
   }
 }

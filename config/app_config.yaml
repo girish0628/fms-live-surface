@@ -16,11 +16,8 @@ paths:
   # Scratch file geodatabase for arcpy intermediate datasets
   scratch_gdb: "//server/FMS/Scratch/fms_scratch.gdb"
 
-  # FMS hourly output root — raster/boundary written here per run
+  # FMS output root — hourly (FMS_<YYYYMMDDHH0000>) and daily (FMS_<YYYYMMDD>) folders written here
   output_root: "//server/FMS_Output"
-
-  # Daily merged TIFF output root (defaults to output_root if not set)
-  daily_output_root: "//server/FMS_Output/Daily"
 
   # Nightly .snp archive destination (used by archive_runner.py)
   archive_root: "//server/FMS/Archive"

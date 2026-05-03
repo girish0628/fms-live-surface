@@ -8,8 +8,8 @@ the full pipeline for a single mine site:
   2. Snippet file conversion  →  MGA50 CSV + JSON config
   3. Modular CSV reprojection (if Modular site)
   4. Raster + boundary generation (arcpy)
-  5. Output folder management + metadata.json + ready.flag
-  6. Publishing handoff (file-trigger or direct API)
+  5. Publishing handoff (file-trigger or direct API — fme_webhook is deferred
+     to fms_finalize_runner which runs after all parallel sites complete)
 
 Usage (Jenkins):
     python -m src.runners.fms_runner \\
@@ -29,19 +29,19 @@ from typing import Any
 
 from src.core.config_loader import ConfigLoader, get_config_value
 from src.core.logger import get_logger, setup_logging
-from src.services.archive_service import ArchiveService
 from src.services.fms_pipeline_service import process_fms_pipeline
 from src.services.modular_csv_service import ModularCsvService
 from src.services.monitoring_service import MonitoringService
 from src.services.publishing_service import PublishingService
 from src.services.snippet_conversion_service import SnippetConversionService
+from src.utils.naming_utils import to_hourly_ts
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FMS Live Surface — Hourly Workflow Runner")
     parser.add_argument("--config", required=True, help="Path to app_config.yaml")
     parser.add_argument("--logging", required=True, help="Path to logging YAML config")
-    parser.add_argument("--site", required=True, help="Mine site code (WB, ER, TG, JB, NM)")
+    parser.add_argument("--site", required=True, help="Mine site code (WB, ER, SF, YND, JB, NWW, MAC)")
     parser.add_argument(
         "--env", default="PROD", choices=["DEV", "UAT", "PROD"],
         help="Deployment environment"
@@ -59,23 +59,21 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
     logger.info("FMS Live Surface Workflow — site: %s", site)
     logger.info("=" * 60)
 
-    site_cfg = get_config_value(cfg, f"sites.{site}", {})
-    paths_cfg = get_config_value(cfg, "paths", {})
+    site_cfg       = get_config_value(cfg, f"sites.{site}", {})
+    paths_cfg      = get_config_value(cfg, "paths", {})
     processing_cfg = get_config_value(cfg, "processing", {})
     publishing_cfg = get_config_value(cfg, "publishing", {})
 
-    landing_zone = site_cfg.get("landing_zone", paths_cfg.get("landing_zone_root", ""))
+    landing_zone  = site_cfg.get("landing_zone", paths_cfg.get("landing_zone_root", ""))
     staging_folder = paths_cfg.get("staging_folder", "")
-    output_root = paths_cfg.get("output_root", "")
-    scratch_gdb = paths_cfg.get("scratch_gdb", "")
-    source_type = site_cfg.get("source_type", "minestar")  # "minestar" | "modular" | "both"
+    output_root   = paths_cfg.get("output_root", "")
+    source_type   = site_cfg.get("source_type", "minestar")
 
-    # Shared run timestamp — all parallel site processes use the same value so
-    # they write into a single FMS_<timestamp> output folder.
-    run_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
-    logger.info("Run timestamp: %s", run_timestamp)
+    # Normalise to YYYYMMDDHH0000 so all parallel site stages share one folder.
+    raw_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
+    run_timestamp = to_hourly_ts(raw_timestamp)
+    logger.info("Run timestamp (normalised): %s", run_timestamp)
 
-    # Staging subfolder mirrors the output folder structure
     staging_run_folder = str(Path(staging_folder) / f"FMS_{run_timestamp}")
 
     # ------------------------------------------------------------------
@@ -144,7 +142,6 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
         )
         modular_result = modular_svc.process()
         logger.info("Modular CSV result: %s", modular_result["status"])
-        # If only Modular source, use its CSV for raster generation
         if source_type == "modular":
             conversion_result = modular_result
 
@@ -154,9 +151,9 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
     csv_path = conversion_result["csv_path"]
 
     # ------------------------------------------------------------------
-    # Step 2: FMS Pipeline — raster + boundary + output folder structure
+    # Step 2: FMS Pipeline — raster + boundary + Source folder
     # ------------------------------------------------------------------
-    logger.info("--- Step 2: FMS Pipeline (raster + boundary + output) ---")
+    logger.info("--- Step 2: FMS Pipeline (raster + boundary) ---")
     fms_config: dict[str, Any] = {
         "cellSize": int(processing_cfg.get("grid_size", 1)),
         "snapRaster": processing_cfg.get("snap_raster", ""),
@@ -179,18 +176,17 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
     logger.info("FMS Pipeline result: %s", pipeline_result["status"])
 
     # ------------------------------------------------------------------
-    # Step 4: Publishing handoff
-    # fme_webhook mode: publishing is deferred to fms_finalize_runner,
-    # which merges all per-site boundaries first then calls the webhook.
-    # file_trigger / direct_api modes: trigger per-site as before.
+    # Step 3: Publishing handoff
+    # fme_webhook mode: deferred to fms_finalize_runner after all sites complete.
+    # file_trigger / direct_api modes: trigger per-site immediately.
     # ------------------------------------------------------------------
     integration_mode = publishing_cfg.get("integration_mode", "fme_webhook")
     if integration_mode == "fme_webhook":
         logger.info(
-            "--- Step 4: Publishing deferred to fms_finalize_runner (fme_webhook mode) ---"
+            "--- Step 3: Publishing deferred to fms_finalize_runner (fme_webhook mode) ---"
         )
     else:
-        logger.info("--- Step 4: Publishing handoff (%s) ---", integration_mode)
+        logger.info("--- Step 3: Publishing handoff (%s) ---", integration_mode)
         pub_svc = PublishingService(
             site=site,
             output_dir=pipeline_result["output_folder"],

@@ -168,7 +168,7 @@ class PublishingService:
         if not flag_path.exists():
             raise PublishingError(
                 f"ready.flag not found in {self.output_dir}. "
-                "Ensure OutputHandlerService ran successfully."
+                "Ensure the fms_finalize_runner completed successfully."
             )
 
         logger.info("ready.flag confirmed: %s", flag_path)

@@ -6,25 +6,21 @@ No external custom dependencies — uses standard Python + arcpy only.
 
 Pipeline:
     CSV (XYZ) → 3D Feature Class → TIN → Raster (GeoTIFF)
-    → Boundary polygon (RasterToPolygon + Dissolve) → Shapefile
-    → ProcessData.json
+    → Boundary polygon (RasterToPolygon + Dissolve) → Shapefile + CSV
 
 Output folder layout (shared across all sites for one run):
-    FMS_<run_timestamp>/                          ← shared by all sites
-    ├── Source/
-    │   ├── FMS_<run_timestamp>_<SITE>.csv        ← one per site
-    │   └── ...
-    ├── FMS_<run_timestamp>_<SITE>.tif            ← one per site
-    ├── FMS_<run_timestamp>_<SITE>_boundary.shp   ← per-site (merged by finalize runner)
-    └── FMS_<run_timestamp>_<SITE>_ProcessData.json
+    FMS_<YYYYMMDDHH0000>/                        ← shared by all parallel sites
+    ├── FMS_<YYYYMMDDHH0000>_<SITE>.tif           ← raster per site
+    └── Source/
+        ├── FMS_<YYYYMMDDHH0000>_boundary_<SITE>.shp  ← boundary shapefile per site
+        └── FMS_<YYYYMMDDHH0000>_boundary_<SITE>.csv  ← boundary polygon vertices per site
 
-The run_timestamp is read from the FMS_RUN_TIMESTAMP environment variable so
-that all parallel Jenkins site processes write into the same shared folder.
-If the variable is not set a timestamp is generated from the current clock.
+The run_timestamp is normalised to YYYYMMDDHH0000 so that all parallel Jenkins
+site processes for the same hour write into the same shared folder.
 """
 from __future__ import annotations
 
-import json
+import csv as csv_mod
 import logging
 import os
 import traceback
@@ -32,6 +28,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from src.utils.naming_utils import to_hourly_ts
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +44,6 @@ def _validate_inputs(
     site_name: str,
     config: dict,
 ) -> None:
-    """Fail fast on bad inputs before touching arcpy."""
     if not os.path.isfile(input_csv):
         raise FileNotFoundError(f"Input CSV not found: {input_csv}")
     if not site_name or not site_name.strip():
@@ -80,7 +77,7 @@ def _checkin_extensions() -> None:
         arcpy.CheckInExtension("Spatial")
         logger.debug("Extensions checked in")
     except Exception:
-        pass  # Never raise during cleanup
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +86,8 @@ def _checkin_extensions() -> None:
 
 def _resolve_sr(value: Any):
     """
-    Return an arcpy.SpatialReference from:
-    - an existing SpatialReference object (returned unchanged)
-    - a path to a .prj file (WKT loaded from file)
-    - a WKT string
-    Returns None if value is falsy.
+    Return an arcpy.SpatialReference from a .prj path, WKT string, or existing
+    SpatialReference object.  Returns None if value is falsy.
     """
     import arcpy
     if not value:
@@ -117,10 +111,7 @@ def _resolve_sr(value: Any):
 # ---------------------------------------------------------------------------
 
 def _get_aoi(aoi_fc: str, aoi_where: str):
-    """
-    Read and union all AOI features matching aoi_where.
-    Returns a single arcpy.Geometry or None if aoi_fc is not configured.
-    """
+    """Read and union all AOI features matching aoi_where."""
     import arcpy
     if not aoi_fc or not arcpy.Exists(aoi_fc):
         if aoi_fc:
@@ -134,52 +125,6 @@ def _get_aoi(aoi_fc: str, aoi_where: str):
     if aoi_geom is None:
         logger.warning("AOI query returned no features — skipping clip")
     return aoi_geom
-
-
-# ---------------------------------------------------------------------------
-# CSV copy with configurable decimal rounding on X, Y, Z
-# ---------------------------------------------------------------------------
-
-def _write_csv_rounded(src: str, dst: str, decimal_places: int) -> int:
-    """
-    Copy *src* CSV to *dst* with X, Y, Z values rounded to *decimal_places*.
-
-    Expects a header row containing X, Y, Z column names (case-insensitive).
-    Any extra columns (e.g. TIMESTAMP) are preserved unchanged.
-    Returns the number of data rows written.
-    """
-    import csv
-
-    fmt = f"{{:.{decimal_places}f}}"
-
-    with open(src, newline="", encoding="utf-8") as fin, \
-         open(dst, "w", newline="", encoding="utf-8") as fout:
-
-        reader = csv.DictReader(fin)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV has no header row: {src}")
-
-        # Identify X / Y / Z columns (case-insensitive)
-        header = list(reader.fieldnames)
-        upper = [h.upper() for h in header]
-        xyz_indices = {upper.index(c) for c in ("X", "Y", "Z") if c in upper}
-        xyz_names = {header[i] for i in xyz_indices}
-
-        writer = csv.DictWriter(fout, fieldnames=header, lineterminator="\n")
-        writer.writeheader()
-
-        rows_written = 0
-        for row in reader:
-            for col in xyz_names:
-                if row[col].strip():
-                    row[col] = fmt.format(float(row[col]))
-            writer.writerow(row)
-            rows_written += 1
-
-    logger.debug(
-        "CSV rounded to %d dp — %d rows written: %s", decimal_places, rows_written, dst
-    )
-    return rows_written
 
 
 # ---------------------------------------------------------------------------
@@ -197,12 +142,10 @@ def _generate_raster(
     aoi_geom,
 ) -> None:
     """
-    Full TIN-based raster pipeline, matching the original MRD server workflow.
+    Full TIN-based raster pipeline.
 
-    All intermediate datasets live in IN_MEMORY or arcpy.env.scratchFolder
-    and are always deleted in the finally block.  UUID prefixes make every
-    dataset name unique, so concurrent Jenkins builds on different sites
-    never collide in shared scratch space.
+    All intermediate datasets use UUID prefixes so concurrent Jenkins builds
+    for different sites never collide in shared scratch space.
     """
     import arcpy
 
@@ -261,8 +204,8 @@ def _generate_boundary(input_raster: str, output_shp: str, item_name: str) -> No
     """
     Convert the valid raster data area to a dissolved boundary shapefile.
 
-    Uses the XOR-to-zero technique (raster ^ raster = integer 0 mask)
-    so that RasterToPolygon captures exactly the footprint of non-NoData cells.
+    Uses the XOR-to-zero technique so RasterToPolygon captures exactly
+    the footprint of non-NoData cells.
     """
     import arcpy
 
@@ -304,30 +247,34 @@ def _generate_boundary(input_raster: str, output_shp: str, item_name: str) -> No
 
 
 # ---------------------------------------------------------------------------
-# ProcessData.json writer
+# Boundary CSV export: polygon vertices → CSV
 # ---------------------------------------------------------------------------
 
-def _write_process_data_json(
-    json_path: str,
-    acquisition_date: str,
-    group_name: str,
-    site_code: str,
-    profile: str = "Elevation_FMS_Minestar_CSV",
-) -> None:
-    payload = {
-        "Fields": {
-            "AcquisitionDate": acquisition_date,
-            "CaptureCategory": "Hourly",
-            "GroupName": group_name,
-            "InputHorizontalProjection": "MGA50",
-            "InputVerticalProjection": "AHD",
-            "Site": site_code,
-        },
-        "Profile": profile,
-        "site": site_code,
-    }
-    Path(json_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    logger.info("ProcessData.json written: %s", json_path)
+def _export_boundary_to_csv(boundary_shp: str, csv_path: str) -> int:
+    """
+    Export boundary polygon vertices to CSV (RING_ID, PART_ID, POINT_ID, X, Y).
+    Returns the number of vertex rows written.
+    """
+    import arcpy
+
+    rows = 0
+    with open(csv_path, "w", newline="", encoding="utf-8") as fout:
+        writer = csv_mod.writer(fout)
+        writer.writerow(["RING_ID", "PART_ID", "POINT_ID", "X", "Y"])
+        ring_id = 0
+        with arcpy.da.SearchCursor(boundary_shp, ["SHAPE@"]) as cursor:
+            for (shape,) in cursor:
+                for part_idx, part in enumerate(shape):
+                    for pt_idx, pt in enumerate(part):
+                        if pt:
+                            writer.writerow([
+                                ring_id, part_idx, pt_idx,
+                                round(pt.X, 2), round(pt.Y, 2),
+                            ])
+                            rows += 1
+                ring_id += 1
+    logger.info("Boundary CSV written (%d vertices): %s", rows, csv_path)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +296,7 @@ def process_fms_pipeline(
     input_csv : str
         Path to the MGA50-projected XYZ CSV (X, Y, Z [, TIMESTAMP] columns).
     output_base_folder : str
-        Root directory where the shared ``FMS_<run_timestamp>`` folder is created.
+        Root directory where the shared ``FMS_<YYYYMMDDHH0000>`` folder lives.
     site_name : str
         Site code, e.g. ``WB``, ``MAC``, ``JB``.
     config : dict
@@ -358,7 +305,6 @@ def process_fms_pipeline(
         Key                   Type    Default   Description
         ──────────────────────────────────────────────────────────────────
         cellSize              int     1         Raster cell size (metres)
-        decimalPlaces         int     2         Decimal places for X, Y, Z in Source CSV
         snapRaster            str     ""        Optional snap raster path
         inputSpatialRef       str     ""        Input CRS (.prj path or WKT)
         outputSpatialRef      str     ""        Output CRS (.prj path or WKT)
@@ -369,23 +315,14 @@ def process_fms_pipeline(
         tinDelineateValue     float   10.0      TIN delineation max edge length
         profile               str     "Elevation_FMS_Minestar_CSV"
     run_timestamp : str or None
-        Timestamp string used in folder and file names.  If *None*, the value
-        is read from the ``FMS_RUN_TIMESTAMP`` environment variable, then falls
-        back to the current clock (``YYYYmmddHHMMSS``).  Set this via Jenkins
-        before launching parallel site stages so all sites share one folder.
+        Raw timestamp string.  Normalised to YYYYMMDDHH0000 internally.
+        Reads ``FMS_RUN_TIMESTAMP`` env var if not passed; falls back to clock.
 
     Returns
     -------
     dict
         status, group_name, output_folder, raster_path,
-        boundary_path, json_path.
-
-    Raises
-    ------
-    FileNotFoundError
-        If *input_csv* does not exist.
-    RuntimeError
-        If arcpy is unavailable or an extension cannot be checked out.
+        boundary_path (SHP in Source/), boundary_csv.
     """
     _validate_inputs(input_csv, output_base_folder, site_name, config)
 
@@ -399,40 +336,26 @@ def process_fms_pipeline(
     if run_timestamp is None:
         run_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
 
-    now = datetime.now()
-    acq_date = now.strftime("%Y-%m-%d %H:%M:%S")
-    group_name = f"FMS_{run_timestamp}_{site_name}"
+    hourly_ts = to_hourly_ts(run_timestamp)
+    group_name = f"FMS_{hourly_ts}_{site_name}"
 
-    # All sites for the same run share a single output folder
-    output_folder = Path(output_base_folder) / f"FMS_{run_timestamp}"
+    output_folder = Path(output_base_folder) / f"FMS_{hourly_ts}"
     source_folder = output_folder / "Source"
-    raster_path = str(output_folder / f"FMS_{run_timestamp}_{site_name}.tif")
-    boundary_shp = str(output_folder / f"FMS_{run_timestamp}_{site_name}_boundary.shp")
-    csv_dest = str(source_folder / f"FMS_{run_timestamp}_{site_name}.csv")
-    json_path = str(output_folder / f"FMS_{run_timestamp}_{site_name}_ProcessData.json")
+    raster_path   = str(output_folder / f"FMS_{hourly_ts}_{site_name}.tif")
+    boundary_shp  = str(source_folder / f"FMS_{hourly_ts}_boundary_{site_name}.shp")
+    boundary_csv  = str(source_folder / f"FMS_{hourly_ts}_boundary_{site_name}.csv")
 
     logger.info("=" * 60)
     logger.info("FMS Pipeline — site: %s  group: %s", site_name, group_name)
     logger.info("Output folder: %s", output_folder)
 
     try:
-        # ----------------------------------------------------------------
         # 1. Output folder structure
-        # ----------------------------------------------------------------
         output_folder.mkdir(parents=True, exist_ok=True)
         source_folder.mkdir(exist_ok=True)
         logger.info("Output structure created")
 
-        # ----------------------------------------------------------------
-        # 2. Copy + rename CSV into Source/
-        # ----------------------------------------------------------------
-        decimal_places = int(config.get("decimalPlaces", 2))
-        rows = _write_csv_rounded(input_csv, csv_dest, decimal_places)
-        logger.info("CSV → Source (%d dp, %d rows): %s", decimal_places, rows, csv_dest)
-
-        # ----------------------------------------------------------------
-        # 3. Resolve spatial references and AOI
-        # ----------------------------------------------------------------
+        # 2. Resolve spatial references and AOI
         arcpy.env.overwriteOutput = True
         input_sr = _resolve_sr(config.get("inputSpatialRef"))
         output_sr = _resolve_sr(config.get("outputSpatialRef"))
@@ -447,9 +370,7 @@ def process_fms_pipeline(
         if config.get("snapRaster"):
             arcpy.env.snapRaster = config["snapRaster"]
 
-        # ----------------------------------------------------------------
-        # 4. Raster generation (CSV → TIN → GeoTIFF)
-        # ----------------------------------------------------------------
+        # 3. Raster generation (CSV → TIN → GeoTIFF)
         _checkout_extensions()
         try:
             logger.info("--- Raster generation ---")
@@ -465,9 +386,7 @@ def process_fms_pipeline(
             )
             logger.info("Raster: %s", raster_path)
 
-            # ----------------------------------------------------------------
-            # 5. Boundary polygon → shapefile
-            # ----------------------------------------------------------------
+            # 4. Boundary polygon → shapefile in Source/
             logger.info("--- Boundary generation ---")
             _generate_boundary(
                 input_raster=raster_path,
@@ -475,19 +394,11 @@ def process_fms_pipeline(
                 item_name=group_name,
             )
 
+            # 5. Export boundary vertices to CSV in Source/
+            _export_boundary_to_csv(boundary_shp, boundary_csv)
+
         finally:
             _checkin_extensions()
-
-        # ----------------------------------------------------------------
-        # 6. ProcessData.json
-        # ----------------------------------------------------------------
-        _write_process_data_json(
-            json_path=json_path,
-            acquisition_date=acq_date,
-            group_name=group_name,
-            site_code=site_name,
-            profile=config.get("profile", "Elevation_FMS_Minestar_CSV"),
-        )
 
         logger.info("FMS Pipeline complete — %s", group_name)
         return {
@@ -496,7 +407,7 @@ def process_fms_pipeline(
             "output_folder": str(output_folder),
             "raster_path": raster_path,
             "boundary_path": boundary_shp,
-            "json_path": json_path,
+            "boundary_csv": boundary_csv,
         }
 
     except Exception:
@@ -517,12 +428,7 @@ def batch_process_fms(
     """
     Run process_fms_pipeline sequentially for a list of (csv_path, site_name) jobs.
 
-    Jenkins parallelises across sites by running separate OS processes, so this
-    helper is primarily useful when a single Jenkins stage must handle multiple
-    CSV inputs for one site (e.g. two delivery streams merged before raster gen).
-
-    A failure in one job is captured and recorded; processing continues for the
-    remaining jobs so a single bad file does not block the entire batch.
+    A failure in one job is captured; processing continues for remaining jobs.
 
     Returns
     -------

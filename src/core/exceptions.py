@@ -22,10 +22,6 @@ class RasterGenerationError(ServiceExecutionError):
     """Raised when raster or TIN generation fails."""
 
 
-class OutputHandlerError(ServiceExecutionError):
-    """Raised when output folder management fails."""
-
-
 class PublishingError(ServiceExecutionError):
     """Raised when handoff to publishing solution fails."""
 

@@ -1,19 +1,20 @@
 """
 Daily merge service.
 
-Finds all hourly TIFFs written to ``output_root`` for a given date
-(folders matching ``FMS_<date>*``), mosaics them into a single daily
-GeoTIFF using ``arcpy.management.MosaicToNewRaster``, and returns the
-output metadata ready for the FME INGEST webhook call.
+Finds all hourly output folders for a given date (``FMS_<date>HH0000/``),
+mosaics per-site TIFFs into per-site daily TIFFs, merges all per-site
+boundary shapefiles into a single dissolved daily boundary, and writes the
+results to a ``FMS_<date>/`` folder under ``output_root``.
 
 Output layout:
-    <daily_output_root>/
-    └── YYYYMMDD_FMS_Daily/
-        ├── YYYYMMDD_FMS_Daily.tif
-        └── ready.flag
+    <output_root>/
+    └── FMS_<YYYYMMDD>/
+        ├── FMS_<YYYYMMDD>_<SITE>.tif   ← one per mine site
+        └── FMS_<YYYYMMDD>_boundary.shp ← dissolved union of all site boundaries
 """
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,31 +22,28 @@ from typing import Any
 
 from src.core.exceptions import DailyMergeError
 from src.core.logger import get_logger
-from src.utils.naming_utils import current_date_str, daily_survey_name
+from src.utils.naming_utils import current_date_str, daily_folder_name, daily_survey_name
 
 
 @dataclass(frozen=True)
 class DailyMergeService:
     """
-    Mosaic all hourly TIFFs for one date into a single daily TIFF.
+    Mosaic hourly TIFFs per site into daily TIFFs and merge all boundaries.
 
     Parameters
     ----------
     output_root : str
-        Root folder where hourly ``FMS_<timestamp>`` folders are written.
-    daily_output_root : str
-        Destination folder for the daily merged TIFF.
+        Root folder containing both hourly ``FMS_<YYYYMMDDHH0000>`` folders
+        and the daily ``FMS_<YYYYMMDD>`` output folder.
     run_date : str
         YYYYMMDD date to process.  Defaults to today if empty.
     coordinate_system_wkt : str
-        WKT of the output spatial reference passed to MosaicToNewRaster.
-        If empty, arcpy inherits from the first input raster.
+        WKT passed to MosaicToNewRaster.  If empty, inherited from first raster.
     cell_size : int
         Output raster cell size in metres (should match hourly cell size).
     """
 
     output_root: str
-    daily_output_root: str
     run_date: str = ""
     coordinate_system_wkt: str = ""
     cell_size: int = 2
@@ -57,62 +55,73 @@ class DailyMergeService:
         Returns
         -------
         dict
-            status, survey_name, date, daily_tiff_path, daily_folder,
-            tiffs_merged, acquisition_date (YYYYMMDDHHMMSS).
+            status, survey_name, date, daily_folder, sites_merged,
+            tiffs_merged, daily_boundary, acquisition_date.
 
         Raises
         ------
         DailyMergeError
-            If no hourly TIFFs are found or the arcpy mosaic fails.
+            If no hourly TIFFs are found or an arcpy operation fails.
         """
         logger = get_logger(__name__)
         date = self.run_date or current_date_str()
-        survey = daily_survey_name(date)
-        daily_folder = Path(self.daily_output_root) / survey
+        survey = daily_survey_name(date)          # FMS_YYYYMMDD
+        folder_name = daily_folder_name(date)     # FMS_YYYYMMDD (same)
+        daily_folder = Path(self.output_root) / folder_name
 
         logger.info("=" * 60)
         logger.info("Daily Merge — date=%s  survey=%s", date, survey)
         logger.info("=" * 60)
 
-        tiff_files = self._collect_hourly_tiffs(date)
-        if not tiff_files:
+        # Collect per-site hourly TIFFs
+        site_tiffs = self._collect_site_tiffs(date)
+        if not site_tiffs:
             raise DailyMergeError(
                 f"No hourly TIFFs found for date {date} under {self.output_root}. "
                 "Ensure all hourly jobs completed before running the daily merge."
             )
-        logger.info("Collected %d hourly TIFFs to merge:", len(tiff_files))
-        for t in tiff_files:
-            logger.info("  %s", t)
+
+        for site, tiffs in site_tiffs.items():
+            logger.info("Site %s: %d hourly TIFFs to merge", site, len(tiffs))
+            for t in tiffs:
+                logger.info("  %s", t)
 
         daily_folder.mkdir(parents=True, exist_ok=True)
-        output_tiff = str(daily_folder / f"{survey}.tif")
 
-        # Check idempotency — skip if already merged
-        if Path(output_tiff).exists():
-            logger.warning(
-                "Daily TIFF already exists — skipping mosaic: %s", output_tiff
-            )
+        # Mosaic per-site TIFFs
+        daily_tiff_paths: dict[str, str] = {}
+        for site, tiffs in sorted(site_tiffs.items()):
+            output_tiff = str(daily_folder / f"FMS_{date}_{site}.tif")
+            if Path(output_tiff).exists():
+                logger.warning("Daily TIFF already exists — skipping: %s", output_tiff)
+            else:
+                self._mosaic_tiffs(tiffs, output_tiff)
+                logger.info("Daily TIFF written: %s", output_tiff)
+            daily_tiff_paths[site] = output_tiff
+
+        # Merge all per-site boundary shapefiles into one dissolved daily boundary
+        boundary_shps = self._collect_boundary_shps(date)
+        daily_boundary = str(daily_folder / f"FMS_{date}_boundary.shp")
+        if boundary_shps:
+            if Path(daily_boundary).exists():
+                logger.warning("Daily boundary already exists — skipping: %s", daily_boundary)
+            else:
+                self._merge_boundaries(boundary_shps, daily_boundary)
+                logger.info("Daily boundary written: %s", daily_boundary)
         else:
-            self._mosaic_tiffs(tiff_files, output_tiff)
-            logger.info("Daily TIFF written: %s", output_tiff)
+            logger.warning("No per-site boundary SHPs found — daily boundary skipped")
+            daily_boundary = ""
 
-        flag = daily_folder / "ready.flag"
-        flag.write_text(
-            f"ready\nsurvey={survey}\ndate={date}\ntiffs_merged={len(tiff_files)}\n",
-            encoding="utf-8",
-        )
-
-        # acquisition_date = midnight of the run date (YYYYMMDDHHMMSS)
-        acquisition_date = f"{date}000000"
-
+        tiffs_merged = sum(len(t) for t in site_tiffs.values())
         result: dict[str, Any] = {
             "status": "SUCCESS",
             "survey_name": survey,
             "date": date,
-            "daily_tiff_path": output_tiff,
             "daily_folder": str(daily_folder),
-            "tiffs_merged": len(tiff_files),
-            "acquisition_date": acquisition_date,
+            "sites_merged": sorted(site_tiffs.keys()),
+            "tiffs_merged": tiffs_merged,
+            "daily_boundary": daily_boundary,
+            "acquisition_date": f"{date}000000",
         }
         logger.info("Daily Merge complete: %s", result)
         return result
@@ -121,20 +130,40 @@ class DailyMergeService:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _collect_hourly_tiffs(self, date: str) -> list[Path]:
+    def _collect_site_tiffs(self, date: str) -> dict[str, list[Path]]:
         """
-        Return all *.tif files inside ``FMS_<date>*`` sub-folders of
-        ``output_root``, sorted for deterministic mosaic ordering.
+        Scan hourly folders ``FMS_<date>HH0000/`` for per-site TIF files.
+
+        Returns {site_code: [sorted tiff paths]}.
         """
         root = Path(self.output_root)
-        tiffs: list[Path] = []
-        for folder in sorted(root.glob(f"FMS_{date}*")):
-            if folder.is_dir():
-                # Exclude any previously generated daily TIFFs that were
-                # accidentally written under the same root.
-                if "Daily" not in folder.name:
-                    tiffs.extend(sorted(folder.glob("*.tif")))
-        return tiffs
+        site_tiffs: dict[str, list[Path]] = {}
+        # Pattern matches FMS_YYYYMMDDHH0000 (6 trailing chars for HH0000)
+        for folder in sorted(root.glob(f"FMS_{date}??????")):
+            if not folder.is_dir():
+                continue
+            for tiff in sorted(folder.glob("*.tif")):
+                # Filename: FMS_YYYYMMDDHH0000_SITE.tif
+                parts = tiff.stem.split("_")
+                if len(parts) >= 3:
+                    site = parts[-1]
+                    site_tiffs.setdefault(site, []).append(tiff)
+        return site_tiffs
+
+    def _collect_boundary_shps(self, date: str) -> list[Path]:
+        """
+        Collect all per-site boundary SHPs from Source/ subfolders of
+        hourly ``FMS_<date>HH0000/`` folders.
+        """
+        root = Path(self.output_root)
+        shps: list[Path] = []
+        for folder in sorted(root.glob(f"FMS_{date}??????")):
+            if not folder.is_dir():
+                continue
+            source = folder / "Source"
+            if source.is_dir():
+                shps.extend(sorted(source.glob("FMS_*_boundary_*.shp")))
+        return shps
 
     def _mosaic_tiffs(self, tiff_files: list[Path], output_tiff: str) -> None:
         try:
@@ -163,6 +192,30 @@ class DailyMergeService:
             )
             logger.debug("MosaicToNewRaster completed → %s", output_tiff)
         except Exception as exc:
+            raise DailyMergeError(f"arcpy MosaicToNewRaster failed: {exc}") from exc
+
+    def _merge_boundaries(self, boundary_shps: list[Path], output_shp: str) -> None:
+        try:
+            import arcpy
+        except ImportError:
             raise DailyMergeError(
-                f"arcpy MosaicToNewRaster failed: {exc}"
-            ) from exc
+                "arcpy is required for boundary merge. "
+                "Run inside ArcGIS Pro Python environment."
+            )
+
+        logger = get_logger(__name__)
+        out_path = Path(output_shp)
+
+        arcpy.env.overwriteOutput = True
+
+        merged_tmp = str(out_path.parent / f"{out_path.stem}_tmp.shp")
+        logger.info("Merging %d boundary SHPs → %s", len(boundary_shps), merged_tmp)
+        arcpy.Merge_management([str(p) for p in boundary_shps], merged_tmp)
+
+        logger.info("Dissolving → %s", output_shp)
+        arcpy.Dissolve_management(merged_tmp, output_shp)
+
+        for ext in (".shp", ".dbf", ".shx", ".prj", ".cpg"):
+            p = Path(merged_tmp.replace(".shp", ext))
+            if p.exists():
+                p.unlink()

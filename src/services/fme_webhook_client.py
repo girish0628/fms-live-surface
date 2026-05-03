@@ -49,7 +49,7 @@ class IngestParams:
     only need to provide the fields marked with no default.
     """
     tiff_path: str                          # Folder containing the TIFFs
-    survey_name: str                        # YYYYMMDDHHMMSS_FMS (or _FMS_Daily)
+    survey_name: str                        # YYYYMMDDHH0000_FMS (hourly) or FMS_YYYYMMDD (daily)
     acquisition_date: str                   # ISO 8601: YYYYMMDDHHMMSS
     project_extent: str                     # Path to merged boundary shapefile
     site: str                               # "Hourly" or "Daily"
