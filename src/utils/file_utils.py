@@ -49,6 +49,11 @@ def safe_remove(path: str | Path) -> bool:
         return False
 
 
+def read_prj(path: str | Path) -> str:
+    """Return the projection definition string from a .prj file."""
+    return Path(path).read_text(encoding="utf-8").strip()
+
+
 def walk_files(folder: str | Path, extension: str = "") -> Iterator[Path]:
     """
     Recursively yield files under *folder*, optionally filtered by *extension*.

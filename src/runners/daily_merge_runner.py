@@ -33,6 +33,7 @@ from src.core.config_loader import ConfigLoader, get_config_value
 from src.core.logger import get_logger, setup_logging
 from src.services.daily_merge_service import DailyMergeService
 from src.services.fme_webhook_client import FmeWebhookClient, IngestParams, fme_client_from_config
+from src.utils.file_utils import read_prj
 from src.utils.naming_utils import current_date_str
 
 
@@ -79,7 +80,8 @@ def run(cfg: dict[str, Any], run_date: str = "") -> None:
     fme_cfg      = get_config_value(cfg, "fme", {})
 
     output_root   = paths_cfg.get("output_root", "")
-    coord_sys_wkt = processing.get("coordinate_system_wkt", "")
+    prj_path      = processing.get("output_spatial_ref", "")
+    coord_sys_wkt = read_prj(prj_path) if prj_path else ""
     cell_size     = int(processing.get("grid_size", 2))
     user_email    = fme_cfg.get("user_email", "")
 

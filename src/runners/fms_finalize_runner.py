@@ -33,6 +33,7 @@ from typing import Any
 from src.core.config_loader import ConfigLoader, get_config_value
 from src.core.logger import get_logger, setup_logging
 from src.services.fme_webhook_client import FmeWebhookClient, IngestParams, fme_client_from_config
+from src.utils.file_utils import read_prj
 from src.utils.naming_utils import hourly_survey_name, to_hourly_ts
 
 
@@ -147,7 +148,8 @@ def finalize(cfg: dict[str, Any], run_timestamp: str) -> None:
     # ----------------------------------------------------------------
     logger.info("--- Step 3: FME INGEST webhook (SITE=Hourly) ---")
 
-    coord_sys_wkt = processing_cfg.get("coordinate_system_wkt", "")
+    prj_path      = processing_cfg.get("output_spatial_ref", "")
+    coord_sys_wkt = read_prj(prj_path) if prj_path else ""
     cell_size     = str(int(processing_cfg.get("grid_size", 2)))
     user_email    = fme_cfg.get("user_email", "")
     acq_date      = hourly_ts  # YYYYMMDDHH0000

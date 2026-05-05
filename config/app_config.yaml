@@ -109,12 +109,8 @@ processing:
   decimal_digits: 2
   grid_size: 2.0              # Cell size in metres; also used as RESOLUTION in FME webhook
 
-  # Coordinate systems — paths to .prj files
+  # Path to output .prj file — WKT is read at runtime and passed to FME COORDINATE_SYSTEM
   output_spatial_ref: "//server/FMS/projection/GDA2020_MGA_Zone_50.prj"
-
-  # WKT string of the output spatial reference, passed to FME COORDINATE_SYSTEM
-  # and MosaicToNewRaster.  Leave empty to derive from the .prj file at runtime.
-  coordinate_system_wkt: ""
 
   # ArcGIS feature class path for AOI polygon
   aoi_feature_class: "//server/FMS/GDB/reference.gdb/FMS_AOI"
