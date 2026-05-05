@@ -13,8 +13,8 @@ env/
 .venv/
 
 # Logs
-logs/
-*.log
+# logs/
+# *.log
 
 # IDE
 .vscode/
