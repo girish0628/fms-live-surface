@@ -22,7 +22,8 @@ python -m src.runners.fms_runner \
     --logging config/logging.yaml \
     --site WB \
     --env DEV \
-    --skip-monitoring
+    --skip-monitoring \
+    [--FMS_ForceDate YYYYMMDD]
 ```
 
 ### Run finalize job (after all parallel site stages)
@@ -39,7 +40,7 @@ python -m src.runners.fms_finalize_runner \
 python -m src.runners.daily_merge_runner \
     --config config/app_config.yaml \
     --logging config/logging.yaml \
-    --date 20260503 \
+    --FMS_ForceDate 20260503 \
     --env DEV
 ```
 

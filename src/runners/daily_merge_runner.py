@@ -18,7 +18,8 @@ Usage (Jenkins):
     python -m src.runners.daily_merge_runner \\
         --config config/app_config.yaml \\
         --logging config/logging.prod.yaml \\
-        --env PROD
+        --env PROD \\
+        [--FMS_ForceDate YYYYMMDD]
 """
 from __future__ import annotations
 
@@ -44,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config",  required=True, help="Path to app_config.yaml")
     parser.add_argument("--logging", required=True, help="Path to logging YAML config")
     parser.add_argument(
-        "--date", default="",
-        help="Date to process (YYYYMMDD). Defaults to today.",
+        "--FMS_ForceDate", action="store", type=str, default="",
+        help="Override the date to process (YYYYMMDD). Defaults to today.",
     )
     parser.add_argument(
         "--env", default="PROD", choices=["NPE", "PROD", "DEV"],
@@ -162,7 +163,7 @@ def main() -> None:
 
     try:
         cfg = ConfigLoader(args.config).load()
-        run(cfg, run_date=args.date)
+        run(cfg, run_date=args.FMS_ForceDate)
     except Exception:
         logger.error("Daily merge failed\n%s", traceback.format_exc())
         sys.exit(1)
