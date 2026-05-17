@@ -18,6 +18,7 @@ Binary format (per Minestar specification):
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import struct
 from dataclasses import dataclass
@@ -26,6 +27,20 @@ from pathlib import Path
 from typing import Any
 
 import numpy
+
+
+def _in_time_window(
+    mtime_epoch: float,
+    since: datetime.datetime | None,
+    until: datetime.datetime | None,
+) -> bool:
+    """Return True if the file mtime falls within [since, until)."""
+    mtime = datetime.datetime.fromtimestamp(mtime_epoch)
+    if since is not None and mtime < since:
+        return False
+    if until is not None and mtime >= until:
+        return False
+    return True
 
 from src.core.exceptions import SnippetConversionError
 from src.core.logger import get_logger
@@ -98,6 +113,8 @@ class SnippetConversionService:
     aoi_feature_class: str = ""
     aoi_where_clause: str = ""
     despike: bool = True
+    filter_since: datetime.datetime | None = None
+    filter_until: datetime.datetime | None = None
 
     def convert(self) -> dict[str, Any]:
         """
@@ -114,14 +131,22 @@ class SnippetConversionService:
         SnippetConversionError
             If any stage of the pipeline fails.
         """
-        import datetime
-
         logger = get_logger(__name__)
         logger.info("=" * 60)
         logger.info("Snippet conversion started — site: %s", self.site)
 
         try:
             snp_files = sorted(Path(self.input_folder).glob("*.snp"))
+            if self.filter_since is not None or self.filter_until is not None:
+                before = len(snp_files)
+                snp_files = [
+                    f for f in snp_files
+                    if _in_time_window(f.stat().st_mtime, self.filter_since, self.filter_until)
+                ]
+                logger.info(
+                    "Time window filter [%s, %s): kept %d / %d snippet files",
+                    self.filter_since, self.filter_until, len(snp_files), before,
+                )
             logger.info("Found %d snippet files in %s", len(snp_files), self.input_folder)
 
             # Points dict: key="X_Y", value={'X', 'Y', 'Z', 'Timestamp'}

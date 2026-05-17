@@ -17,13 +17,12 @@ Usage (Jenkins, after parallel site stages):
     python -m src.runners.fms_finalize_runner \\
         --config config/app_config.yaml \\
         --logging config/logging.prod.yaml \\
-        --run-timestamp %FMS_RUN_TIMESTAMP% \\
-        --env PROD
+        --run-timestamp 20260503110000 \\
+        --env NPE
 """
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import sys
 import traceback
@@ -44,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config",  required=True, help="Path to app_config.yaml")
     parser.add_argument("--logging", required=True, help="Path to logging YAML config")
     parser.add_argument(
-        "--run-timestamp", default=None,
-        help="Timestamp of the FMS run (reads FMS_RUN_TIMESTAMP env var if omitted)",
+        "--run-timestamp", required=True,
+        help="Timestamp of the FMS run (YYYYMMDDHH0000). Passed from Jenkins via env.RUN_TIMESTAMP.",
     )
     parser.add_argument(
         "--env", default="PROD", choices=["NPE", "PROD", "DEV"],
@@ -193,13 +192,7 @@ def main() -> None:
     setup_logging(args.logging)
     logger = get_logger(__name__)
 
-    run_timestamp = args.run_timestamp or os.environ.get("FMS_RUN_TIMESTAMP", "")
-    if not run_timestamp:
-        logger.error(
-            "run_timestamp is required. Pass --run-timestamp or set FMS_RUN_TIMESTAMP env var."
-        )
-        sys.exit(1)
-
+    run_timestamp = args.run_timestamp
     logger.info("Environment: %s  run_timestamp: %s", args.env, run_timestamp)
 
     try:

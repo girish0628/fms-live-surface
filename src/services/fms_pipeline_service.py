@@ -147,11 +147,14 @@ def _generate_raster(
     All intermediate datasets use UUID prefixes so concurrent Jenkins builds
     for different sites never collide in shared scratch space.
     """
+    import tempfile
+
     import arcpy
 
     run_id = uuid.uuid4().hex[:8]
     fc_3d = f"IN_MEMORY/{run_id}_3D"
-    scratch_tin = os.path.join(arcpy.env.scratchFolder, f"tin_{run_id}")
+    # Use a guaranteed-local temp directory — TINs cannot be created on UNC/network paths.
+    scratch_tin = os.path.join(tempfile.gettempdir(), f"tin_{run_id}")
     pre_clip = f"IN_MEMORY/{run_id}_raw" if aoi_geom else None
 
     try:
@@ -161,7 +164,15 @@ def _generate_raster(
             input_sr, avg_point_spacing, "", "DECIMAL_POINT",
         )
 
-        logger.info("Step 2: 3D Feature Class → TIN")
+        feature_count = int(arcpy.GetCount_management(fc_3d)[0])
+        logger.debug("Step 1: %d multipoint feature(s) in 3D FC", feature_count)
+        if feature_count == 0:
+            raise ValueError(
+                f"No elevation points were produced from {csv_path} — "
+                "cannot create TIN (CSV may be empty or outside AOI)"
+            )
+
+        logger.info("Step 2: 3D Feature Class → TIN  (scratch: %s)", scratch_tin)
         arcpy.CreateTin_3d(
             scratch_tin, output_sr,
             f"{fc_3d} Shape.Z Mass_Points <None>",
@@ -316,7 +327,7 @@ def process_fms_pipeline(
         profile               str     "Elevation_FMS_Minestar_CSV"
     run_timestamp : str or None
         Raw timestamp string.  Normalised to YYYYMMDDHH0000 internally.
-        Reads ``FMS_RUN_TIMESTAMP`` env var if not passed; falls back to clock.
+        Falls back to current clock time when not passed.
 
     Returns
     -------
@@ -334,7 +345,7 @@ def process_fms_pipeline(
         ) from exc
 
     if run_timestamp is None:
-        run_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
+        run_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
     hourly_ts = to_hourly_ts(run_timestamp)
     group_name = f"FMS_{hourly_ts}_{site_name}"

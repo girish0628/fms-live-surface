@@ -1,7 +1,6 @@
 """Survey naming conventions for FMS Live Surface."""
 from __future__ import annotations
 
-import os
 from datetime import datetime
 
 SURVEY_TAG = "FMS"
@@ -65,9 +64,3 @@ def current_date_str() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
-def run_timestamp_from_env() -> str:
-    """
-    Read FMS_RUN_TIMESTAMP from environment, or generate one.
-    Jenkins sets this once before all parallel site stages fire.
-    """
-    return os.environ.get("FMS_RUN_TIMESTAMP") or current_run_timestamp()

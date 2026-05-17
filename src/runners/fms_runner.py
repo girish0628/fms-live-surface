@@ -16,12 +16,22 @@ Usage (Jenkins):
         --config config/app_config.yaml \\
         --logging config/logging.prod.yaml \\
         --site WB \\
-        --env PROD
+        --env NPE \\
+        --FMS_RunTimestamp 20260503110000 \\
+        [--FMS_ForceDate YYYYMMDD]
+
+Usage (local dev / manual rerun):
+    python -m src.runners.fms_runner \\
+        --config config/app_config.yaml \\
+        --logging config/logging.yaml \\
+        --site WB \\
+        --env DEV \\
+        --skip-monitoring \\
+        [--FMS_ForceDate YYYYMMDD]
 """
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -43,17 +53,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging", required=True, help="Path to logging YAML config")
     parser.add_argument("--site", required=True, help="Mine site code (WB, ER, SF, YND, JB, NWW, MAC)")
     parser.add_argument(
-        "--env", default="PROD", choices=["DEV", "UAT", "PROD"],
-        help="Deployment environment"
+        "--env", default="PROD", choices=["DEV", "UAT", "NPE", "PROD"],
+        help="Deployment environment",
     )
     parser.add_argument(
         "--skip-monitoring", action="store_true",
-        help="Skip monitoring check (useful in DEV)"
+        help="Skip monitoring check (useful in DEV)",
+    )
+    parser.add_argument(
+        "--FMS_RunTimestamp", action="store", type=str, default="",
+        help=(
+            "Full run timestamp (YYYYMMDDHH0000). When provided, snippet and CSV files are "
+            "filtered to those modified between midnight and the start of this hour. "
+            "Jenkins always passes this; omit only for local dev."
+        ),
+    )
+    parser.add_argument(
+        "--FMS_ForceDate", action="store", type=str, default="",
+        help=(
+            "Override the run date (YYYYMMDD). Ignored when --FMS_RunTimestamp is set. "
+            "No file time filtering is applied. Useful for local dev reruns."
+        ),
     )
     return parser.parse_args()
 
 
-def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
+def run(
+    cfg: dict[str, Any],
+    site: str,
+    run_timestamp: str,
+    skip_monitoring: bool = False,
+    filter_since: datetime | None = None,
+    filter_until: datetime | None = None,
+) -> None:
     logger = get_logger(__name__)
     logger.info("=" * 60)
     logger.info("FMS Live Surface Workflow — site: %s", site)
@@ -64,15 +96,14 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
     processing_cfg = get_config_value(cfg, "processing", {})
     publishing_cfg = get_config_value(cfg, "publishing", {})
 
-    landing_zone  = site_cfg.get("landing_zone", paths_cfg.get("landing_zone_root", ""))
+    landing_zone   = site_cfg.get("landing_zone", paths_cfg.get("landing_zone_root", ""))
     staging_folder = paths_cfg.get("staging_folder", "")
-    output_root   = paths_cfg.get("output_root", "")
-    source_type   = site_cfg.get("source_type", "minestar")
+    output_root    = paths_cfg.get("output_root", "")
+    source_type    = site_cfg.get("source_type", "minestar")
 
-    # Normalise to YYYYMMDDHH0000 so all parallel site stages share one folder.
-    raw_timestamp = os.environ.get("FMS_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d%H%M%S")
-    run_timestamp = to_hourly_ts(raw_timestamp)
-    logger.info("Run timestamp (normalised): %s", run_timestamp)
+    logger.info("Run timestamp: %s", run_timestamp)
+    if filter_since or filter_until:
+        logger.info("File time filter: [%s, %s)", filter_since, filter_until)
 
     staging_run_folder = str(Path(staging_folder) / f"FMS_{run_timestamp}")
 
@@ -112,6 +143,8 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
             aoi_feature_class=processing_cfg.get("aoi_feature_class", ""),
             aoi_where_clause=site_cfg.get("aoi_where_clause", f"MineSite='{site}'"),
             despike=processing_cfg.get("despike", True),
+            filter_since=filter_since,
+            filter_until=filter_until,
         )
         conversion_result = snippet_svc.convert()
         logger.info("Snippet conversion result: %s", conversion_result["status"])
@@ -139,6 +172,8 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
             aoi_feature_class=processing_cfg.get("aoi_feature_class", ""),
             aoi_where_clause=site_cfg.get("aoi_where_clause", f"MineSite='{site}'"),
             despike=processing_cfg.get("despike", True),
+            filter_since=filter_since,
+            filter_until=filter_until,
         )
         modular_result = modular_svc.process()
         logger.info("Modular CSV result: %s", modular_result["status"])
@@ -206,14 +241,39 @@ def run(cfg: dict[str, Any], site: str, skip_monitoring: bool = False) -> None:
 
 def main() -> None:
     args = parse_args()
-
     setup_logging(args.logging)
     logger = get_logger(__name__)
     logger.info("Environment: %s  Site: %s", args.env, args.site)
 
+    # Timestamp priority: --FMS_RunTimestamp > --FMS_ForceDate > current datetime
+    if args.FMS_RunTimestamp:
+        raw_ts = args.FMS_RunTimestamp
+    elif args.FMS_ForceDate:
+        raw_ts = args.FMS_ForceDate + datetime.now().strftime("%H%M%S")
+    else:
+        raw_ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    run_timestamp = to_hourly_ts(raw_ts)
+    logger.info("Run timestamp (normalised): %s", run_timestamp)
+
+    # File time filter applied only when --FMS_RunTimestamp is explicitly provided.
+    # Window: [midnight of run date, start of run hour)
+    filter_since: datetime | None = None
+    filter_until: datetime | None = None
+    if args.FMS_RunTimestamp:
+        ts = run_timestamp  # YYYYMMDDHH0000
+        y, m, d, h = int(ts[:4]), int(ts[4:6]), int(ts[6:8]), int(ts[8:10])
+        filter_since = datetime(y, m, d, 0, 0, 0)
+        filter_until = datetime(y, m, d, h, 0, 0)
+        logger.info("File time filter: [%s, %s)", filter_since, filter_until)
+
     try:
         cfg = ConfigLoader(args.config).load()
-        run(cfg, args.site, skip_monitoring=args.skip_monitoring)
+        run(
+            cfg, args.site, run_timestamp,
+            skip_monitoring=args.skip_monitoring,
+            filter_since=filter_since,
+            filter_until=filter_until,
+        )
     except Exception:
         logger.error("Workflow failed", exc_info=True)
         sys.exit(1)
