@@ -16,6 +16,12 @@ pipeline {
             defaultValue: '',
             description: 'Optional: Override the run timestamp. For hourly mode use YYYYMMDDHH0000; for daily-merge use YYYYMMDD. Leave blank to auto-generate from current time.'
         )
+
+        choice(
+            name: 'ARCHIVE_DESTINATION',
+            choices: ['network', 'blob', 'both'],
+            description: 'Destination for nightly snippet archive: network share only, Azure Blob only, or both.'
+        )
     }
 
     options {
@@ -536,6 +542,7 @@ pipeline {
                             --config "%CONFIG_DIR%\\app_config.yaml" ^
                             --logging "%CONFIG_DIR%\\logging.yaml" ^
                             --env "%ENV_NAME%" ^
+                            --destination "${params.ARCHIVE_DESTINATION}" ^
                             ${env.DRY_RUN == 'true' ? '--dry-run' : ''}
 
                         IF ERRORLEVEL 1 (
@@ -642,6 +649,8 @@ pipeline {
                         }
                         statusIcon("site-status/daily-finalize.txt", "Daily Finalize")
 
+                    } else if (env.RUN_MODE == 'archive') {
+                        statusIcon("site-status/archive.txt", "Archive (${params.ARCHIVE_DESTINATION})")
                     } else {
                         statusIcon("site-status/${env.RUN_MODE}.txt", env.RUN_MODE)
                     }

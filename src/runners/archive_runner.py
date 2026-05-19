@@ -8,7 +8,8 @@ Usage (Jenkins):
     python -m src.runners.archive_runner \\
         --config config/app_config.yaml \\
         --logging config/logging.prod.yaml \\
-        --env PROD
+        --env PROD \\
+        --destination network
 """
 from __future__ import annotations
 
@@ -34,20 +35,45 @@ def parse_args() -> argparse.Namespace:
         help="Mine site to archive (default: ALL)",
     )
     parser.add_argument(
+        "--destination",
+        default=None,
+        choices=["network", "blob", "both"],
+        help=(
+            "Archive destination: network (network share), blob (Azure Blob Storage), "
+            "or both. Overrides archive.destination in app_config.yaml."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Log what would happen without modifying files",
     )
     return parser.parse_args()
 
 
-def run(cfg: dict[str, Any], site_filter: str, dry_run: bool) -> None:
+def run(
+    cfg: dict[str, Any],
+    site_filter: str,
+    destination: str | None,
+    dry_run: bool,
+) -> None:
     logger = get_logger(__name__)
     logger.info("=" * 60)
-    logger.info("FMS Archive Runner — site_filter=%s  dry_run=%s", site_filter, dry_run)
+    logger.info(
+        "FMS Archive Runner — site_filter=%s  destination=%s  dry_run=%s",
+        site_filter, destination or "(from config)", dry_run,
+    )
     logger.info("=" * 60)
 
-    sites: dict[str, Any] = get_config_value(cfg, "sites", {})
-    archive_root = get_config_value(cfg, "paths.archive_root", "")
+    sites: dict[str, Any]     = get_config_value(cfg, "sites", {})
+    archive_root               = get_config_value(cfg, "paths.archive_root", "")
+    archive_cfg: dict[str, Any] = get_config_value(cfg, "archive", {})
+    blob_cfg: dict[str, Any]   = get_config_value(cfg, "blob_storage", {})
+
+    # CLI --destination takes priority; fall back to config, then default
+    effective_destination = destination or archive_cfg.get("destination", "network")
+    blob_prefix           = archive_cfg.get("blob_prefix", "fms-snippets/")
+
+    logger.info("Effective destination: %s", effective_destination)
 
     target_sites = (
         {k: v for k, v in sites.items() if k == site_filter}
@@ -66,15 +92,23 @@ def run(cfg: dict[str, Any], site_filter: str, dry_run: bool) -> None:
             site=site,
             landing_zone=site_cfg.get("landing_zone", ""),
             archive_root=archive_root,
+            destination=effective_destination,
+            blob_connection_string_env_var=blob_cfg.get(
+                "connection_string_env_var", "AZURE_STORAGE_CONNECTION_STRING"
+            ),
+            blob_container_name=blob_cfg.get("container_name", "fms-archive"),
+            blob_prefix=blob_prefix,
             dry_run=dry_run,
         )
         result = svc.archive()
         summary.append(result)
         logger.info(
-            "  %s → %d files, %.2f MB",
+            "  %s → %d files, %.2f MB  archive=%s  blob=%s",
             result["status"],
             result["files_archived"],
             result["bytes_archived"] / 1_048_576,
+            result.get("archive_path") or "-",
+            result.get("blob_path") or "-",
         )
 
     logger.info("=" * 60)
@@ -90,7 +124,7 @@ def main() -> None:
 
     try:
         cfg = ConfigLoader(args.config).load()
-        run(cfg, site_filter=args.site, dry_run=args.dry_run)
+        run(cfg, site_filter=args.site, destination=args.destination, dry_run=args.dry_run)
     except Exception:
         logger.error("Archive runner failed", exc_info=True)
         sys.exit(1)
