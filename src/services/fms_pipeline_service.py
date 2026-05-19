@@ -298,6 +298,7 @@ def process_fms_pipeline(
     site_name: str,
     config: dict[str, Any],
     run_timestamp: str | None = None,
+    output_label: str | None = None,
 ) -> dict[str, Any]:
     """
     Run the complete FMS elevation pipeline for one site.
@@ -328,6 +329,12 @@ def process_fms_pipeline(
     run_timestamp : str or None
         Raw timestamp string.  Normalised to YYYYMMDDHH0000 internally.
         Falls back to current clock time when not passed.
+        Ignored when *output_label* is supplied.
+    output_label : str or None
+        Override the folder/file label (the part after ``FMS_``).
+        Pass ``YYYYMMDD`` for daily runs so output lands in ``FMS_<date>/``
+        instead of the default ``FMS_<YYYYMMDDHH0000>/``.
+        When ``None``, the label is derived from *run_timestamp* as usual.
 
     Returns
     -------
@@ -344,17 +351,16 @@ def process_fms_pipeline(
             "arcpy is not available — ArcGIS Pro must be installed and licensed."
         ) from exc
 
-    if run_timestamp is None:
-        run_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    label = output_label or to_hourly_ts(
+        run_timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+    )
+    group_name = f"FMS_{label}_{site_name}"
 
-    hourly_ts = to_hourly_ts(run_timestamp)
-    group_name = f"FMS_{hourly_ts}_{site_name}"
-
-    output_folder = Path(output_base_folder) / f"FMS_{hourly_ts}"
+    output_folder = Path(output_base_folder) / f"FMS_{label}"
     source_folder = output_folder / "Source"
-    raster_path   = str(output_folder / f"FMS_{hourly_ts}_{site_name}.tif")
-    boundary_shp  = str(source_folder / f"FMS_{hourly_ts}_boundary_{site_name}.shp")
-    boundary_csv  = str(source_folder / f"FMS_{hourly_ts}_boundary_{site_name}.csv")
+    raster_path   = str(output_folder / f"FMS_{label}_{site_name}.tif")
+    boundary_shp  = str(source_folder / f"FMS_{label}_boundary_{site_name}.shp")
+    boundary_csv  = str(source_folder / f"FMS_{label}_boundary_{site_name}.csv")
 
     logger.info("=" * 60)
     logger.info("FMS Pipeline — site: %s  group: %s", site_name, group_name)
@@ -435,6 +441,7 @@ def batch_process_fms(
     output_base_folder: str,
     config: dict[str, Any],
     run_timestamp: str | None = None,
+    output_label: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run process_fms_pipeline sequentially for a list of (csv_path, site_name) jobs.
@@ -451,7 +458,7 @@ def batch_process_fms(
     for csv_path, site_name in jobs:
         logger.info("Batch job: site=%s  csv=%s", site_name, csv_path)
         try:
-            result = process_fms_pipeline(csv_path, output_base_folder, site_name, config, run_timestamp)
+            result = process_fms_pipeline(csv_path, output_base_folder, site_name, config, run_timestamp, output_label)
         except Exception:  # noqa: BLE001
             result = {
                 "status": "FAILED",

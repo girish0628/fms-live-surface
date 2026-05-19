@@ -14,7 +14,7 @@ pipeline {
         string(
             name: 'FMS_RUN_TIMESTAMP',
             defaultValue: '',
-            description: 'Optional: Force a specific processing date (YYYYMMDD). Leave blank to use today. Used for manual reruns of a past date.'
+            description: 'Optional: Override the run timestamp. For hourly mode use YYYYMMDDHH0000; for daily-merge use YYYYMMDD. Leave blank to auto-generate from current time.'
         )
     }
 
@@ -40,7 +40,7 @@ pipeline {
         CONFIG_DIR      = "${WORKSPACE}\\mtd_fms_minestar\\config"
         CONFIG_TEMP_DIR = "${WORKSPACE}\\config-repo-temp"
 
-        SITES = 'SF,MAC,MACAW,JBAH,BMM'
+        SITES = 'WB,ER,SF,YND,JB,NWW,MAC'
 
         SKIP_MONITORING = 'true'
         DRY_RUN = 'false'
@@ -206,12 +206,12 @@ pipeline {
                     def minute = now.format('mm', perthTz) as Integer
                     def dayOfWeek = now.format('u', perthTz) as Integer
 
-                    if (hour == 0 && minute == 0) {
+                    if (hour == 0) {
                         env.RUN_MODE = 'daily-merge'
-                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMdd', perthTz) : FMS_RUN_TIMESTAMP
-                    } else if (hour == 0 && minute == 30) {
-                        env.RUN_MODE = 'daily-cleanup'
-                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMdd', perthTz) : FMS_RUN_TIMESTAMP
+                        // FMS_RUN_TIMESTAMP for daily-merge is the DATA date (yesterday),
+                        // not today — the job runs at midnight but processes the prior day's files.
+                        def yesterday = new Date(now.time - 24 * 60 * 60 * 1000L)
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? yesterday.format('yyyyMMdd', perthTz) : FMS_RUN_TIMESTAMP
                     } else if (dayOfWeek == 7 && hour == 2 && minute == 30) {
                         env.RUN_MODE = 'weekly-cleanup'
                         env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHHmmss', perthTz) : FMS_RUN_TIMESTAMP
@@ -220,7 +220,7 @@ pipeline {
                         env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHHmmss', perthTz) : FMS_RUN_TIMESTAMP
                     } else if (hour >= 1 && hour <= 23) {
                         env.RUN_MODE = 'hourly'
-                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHH') + '0000' : FMS_RUN_TIMESTAMP
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHH', perthTz) + '0000' : FMS_RUN_TIMESTAMP
                     } else {
                         env.RUN_MODE = 'skip'
                         env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHHmmss', perthTz) : FMS_RUN_TIMESTAMP
@@ -354,7 +354,72 @@ pipeline {
             }
         }
 
-        stage('Daily -- Merge Hourly TIFFs + FME INGEST') {
+        stage('Daily -- Process Sites Parallel') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'daily-merge' && env.ENABLE_DAILY_MERGE == 'true'
+                }
+            }
+
+            steps {
+                script {
+                    def siteList = env.SITES
+                        .split(',')
+                        .collect { it.trim() }
+                        .findAll { it }
+
+                    def branches = [:]
+
+                    for (int i = 0; i < siteList.size(); i++) {
+                        def site = siteList[i]
+
+                        branches["Site ${site}"] = {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                bat """
+                                    @echo off
+                                    setlocal
+
+                                    echo ==========================================
+                                    echo Daily FMS processing
+                                    echo ENV_NAME          = %ENV_NAME%
+                                    echo SITE              = ${site}
+                                    echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                                    echo Date              = %DATE% Time = %TIME%
+                                    echo ==========================================
+
+                                    if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+
+                                    cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                                    "%ArcPy3%" ^
+                                        -m src.runners.daily_merge_runner ^
+                                        --config "%CONFIG_DIR%\\app_config.yaml" ^
+                                        --logging "%CONFIG_DIR%\\logging.yaml" ^
+                                        --site ${site} ^
+                                        --FMS_ForceDate "%FMS_RUN_TIMESTAMP%" ^
+                                        --env "%ENV_NAME%"
+
+                                    IF ERRORLEVEL 1 (
+                                        echo FAILED > "%WORKSPACE%\\site-status\\daily-${site}.txt"
+                                        echo [ERROR] Daily processing failed for site ${site}
+                                        exit /b 1
+                                    )
+
+                                    echo SUCCESS > "%WORKSPACE%\\site-status\\daily-${site}.txt"
+                                    echo [SUCCESS] Daily processing completed for site ${site}
+                                    exit /b 0
+                                """
+                            }
+                        }
+                    }
+
+                    branches.failFast = false
+                    parallel branches
+                }
+            }
+        }
+
+        stage('Daily -- Finalize Boundaries + FME INGEST + FME DELETE') {
             when {
                 expression {
                     return env.RUN_MODE == 'daily-merge' && env.ENABLE_DAILY_MERGE == 'true'
@@ -368,7 +433,7 @@ pipeline {
                         setlocal
 
                         echo ==========================================
-                        echo Daily Merge Process
+                        echo Daily Finalize Process
                         echo ENV_NAME          = %ENV_NAME%
                         echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
                         echo Date              = %DATE% Time = %TIME%
@@ -379,20 +444,20 @@ pipeline {
                         cd /d "%AUTOMATION_DIR%" || exit /b 1
 
                         "%ArcPy3%" ^
-                            -m src.runners.daily_merge_runner ^
+                            -m src.runners.daily_finalize_runner ^
                             --config "%CONFIG_DIR%\\app_config.yaml" ^
                             --logging "%CONFIG_DIR%\\logging.yaml" ^
-                            --run-timestamp "%FMS_RUN_TIMESTAMP%" ^
+                            --run-date "%FMS_RUN_TIMESTAMP%" ^
                             --env "%ENV_NAME%"
 
                         IF ERRORLEVEL 1 (
-                            echo FAILED > "%WORKSPACE%\\site-status\\daily-merge.txt"
-                            echo [ERROR] Daily merge failed
+                            echo FAILED > "%WORKSPACE%\\site-status\\daily-finalize.txt"
+                            echo [ERROR] Daily finalize failed
                             exit /b 1
                         )
 
-                        echo SUCCESS > "%WORKSPACE%\\site-status\\daily-merge.txt"
-                        echo [SUCCESS] Daily merge completed
+                        echo SUCCESS > "%WORKSPACE%\\site-status\\daily-finalize.txt"
+                        echo [SUCCESS] Daily finalize completed
                         exit /b 0
                     """
                 }
@@ -544,6 +609,17 @@ pipeline {
                     summaryLines << "Build: ${env.BUILD_NUMBER}"
                     summaryLines << "--------------------------------"
 
+                    def statusIcon = { String statusFile, String label ->
+                        def status = fileExists(statusFile)
+                            ? readFile(statusFile).trim()
+                            : 'NOT_RUN'
+                        def icon = (status == 'SUCCESS') ? '✅'
+                                 : (status == 'FAILED')  ? '❌'
+                                 : '⚠️'
+                        if (status == 'FAILED') currentBuild.result = 'UNSTABLE'
+                        summaryLines << "${icon} ${label}: ${status}"
+                    }
+
                     if (env.RUN_MODE == 'hourly') {
                         def siteList = env.SITES
                             .split(',')
@@ -551,60 +627,23 @@ pipeline {
                             .findAll { it }
 
                         for (site in siteList) {
-                            def statusFile = "site-status/hourly-${site}.txt"
-                            def status = fileExists(statusFile)
-                                ? readFile(statusFile).trim()
-                                : 'NOT_RUN'
-
-                            def icon = '⚪'
-
-                            if (status == 'SUCCESS') {
-                                icon = '✅'
-                            } else if (status == 'FAILED') {
-                                icon = '❌'
-                                currentBuild.result = 'UNSTABLE'
-                            } else {
-                                icon = '⚠️'
-                            }
-
-                            summaryLines << "${icon} Hourly ${site}: ${status}"
+                            statusIcon("site-status/hourly-${site}.txt", "Hourly ${site}")
                         }
+                        statusIcon("site-status/hourly-finalize.txt", "Hourly Finalize")
 
-                        def finalizeStatusFile = "site-status/hourly-finalize.txt"
-                        def finalizeStatus = fileExists(finalizeStatusFile)
-                            ? readFile(finalizeStatusFile).trim()
-                            : 'NOT_RUN'
+                    } else if (env.RUN_MODE == 'daily-merge') {
+                        def siteList = env.SITES
+                            .split(',')
+                            .collect { it.trim() }
+                            .findAll { it }
 
-                        def finalizeIcon = '⚪'
-
-                        if (finalizeStatus == 'SUCCESS') {
-                            finalizeIcon = '✅'
-                        } else if (finalizeStatus == 'FAILED') {
-                            finalizeIcon = '❌'
-                            currentBuild.result = 'UNSTABLE'
-                        } else {
-                            finalizeIcon = '⚠️'
+                        for (site in siteList) {
+                            statusIcon("site-status/daily-${site}.txt", "Daily ${site}")
                         }
+                        statusIcon("site-status/daily-finalize.txt", "Daily Finalize")
 
-                        summaryLines << "${finalizeIcon} Hourly Finalize: ${finalizeStatus}"
                     } else {
-                        def statusFile = "site-status/${env.RUN_MODE}.txt"
-                        def status = fileExists(statusFile)
-                            ? readFile(statusFile).trim()
-                            : 'NOT_RUN'
-
-                        def icon = '⚪'
-
-                        if (status == 'SUCCESS') {
-                            icon = '✅'
-                        } else if (status == 'FAILED') {
-                            icon = '❌'
-                            currentBuild.result = 'UNSTABLE'
-                        } else {
-                            icon = '⚠️'
-                        }
-
-                        summaryLines << "${icon} ${env.RUN_MODE}: ${status}"
+                        statusIcon("site-status/${env.RUN_MODE}.txt", env.RUN_MODE)
                     }
 
                     def summaryText = summaryLines.join('\n')
@@ -630,7 +669,7 @@ pipeline {
 
         unstable {
             mail(
-                to: 'arish.pathak@bhp.com',
+                to: 'girish.pathak@bhp.com',
                 subject: '[JENKINS UNSTABLE] FMS Live Surface -- ${env.MODE} -- ${env.ENV_NAME}',
                 body: """
 FMS Live Surface pipeline completed as UNSTABLE.
@@ -647,7 +686,7 @@ Check dashboard summary and logs for details.
 
         failure {
             mail(
-                to: 'grish.pathak@bhp.com',
+                to: 'girish.pathak@bhp.com',
                 subject: '[JENKINS FAILURE] FMS Live Surface -- ${env.RUN_MODE} -- ${env.ENV_NAME}',
                 body: """
 FMS Live Surface pipeline failed.
