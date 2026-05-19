@@ -1,226 +1,661 @@
-// =============================================================================
-// FMS Live Surface — Unified Jenkins Pipeline
-// =============================================================================
-//
-// This single Jenkinsfile drives all four FMS automation workflows.
-// Create four separate Jenkins Pipeline jobs (one per mode), each pointing
-// at this file in SCM and setting the MODE parameter as its default value.
-//
-//  Job name                 | MODE            | Trigger
-//  -------------------------|-----------------|---------------------------
-//  FMS-Hourly               | hourly          | cron('H * * * *')
-//  FMS-Daily-Merge          | daily-merge     | cron('30 0 * * *')
-//  FMS-Daily-Cleanup        | daily-cleanup   | cron('0 1 * * *')
-//  FMS-Weekly-Cleanup       | weekly          | cron('0 2 * * 0')
-//
-// ENVIRONMENT:
-//   DEPLOY_ENV is read from Jenkins Global Properties (Manage Jenkins →
-//   System → Global properties → Environment variables).
-//   Set DEPLOY_ENV=NPE on the NPE controller and DEPLOY_ENV=PROD on PROD.
-//   No need to pass it as a build parameter — it is injected automatically.
-//
-// SITES:
-//   All 7 mine sites run in parallel for MODE=hourly.  To run a subset
-//   during testing, override the SITES parameter when triggering manually.
-// =============================================================================
+// All mine sites run in parallel for hourly processing.
+// For full sites, during testing override the SITES parameter when triggering manually.
 
 pipeline {
     agent any
 
     parameters {
-        choice(
-            name: 'MODE',
-            choices: ['hourly', 'daily-merge', 'daily-cleanup', 'weekly'],
-            description: 'Pipeline mode to execute'
-        )
         string(
-            name: 'SITES',
-            defaultValue: 'WB,ER,SF,YND,JB,NWW,MAC',
-            description: 'Comma-separated site codes for hourly mode'
+            name: 'FMS_FORCE_DATE',
+            defaultValue: '',
+            description: 'Optional: Force a specific processing date (YYYYMMDD). Leave blank to use today. Used for manual reruns of a past date.'
         )
+
         string(
-            name: 'CONFIG_PATH',
-            defaultValue: 'config/app_config.yaml',
-            description: 'App config YAML path'
+            name: 'FMS_RUN_TIMESTAMP',
+            defaultValue: '',
+            description: 'Optional: Force a specific processing date (YYYYMMDD). Leave blank to use today. Used for manual reruns of a past date.'
         )
-        string(
-            name: 'LOGGING_PATH',
-            defaultValue: 'config/logging.prod.yaml',
-            description: 'Logging config YAML path'
-        )
-        booleanParam(
-            name: 'SKIP_MONITORING',
-            defaultValue: false,
-            description: 'Skip file delivery monitoring check (hourly only)'
-        )
-        booleanParam(
-            name: 'DRY_RUN',
-            defaultValue: false,
-            description: 'Dry-run mode (weekly cleanup only — no uploads/deletes)'
-        )
+    }
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
     }
 
     environment {
-        // DEPLOY_ENV is set in Jenkins Global Properties — do not hardcode here.
-        // Fallback to 'NPE' keeps NPE jobs safe if the variable is ever unset.
-        DEPLOY_ENV = "${env.DEPLOY_ENV ?: 'NPE'}"
+        ENV_NAME = 'NPE'
 
-        // Shared run timestamp: set once in the 'Setup' stage so that all
-        // parallel site stages write into the same FMS_<timestamp> folder.
-        FMS_RUN_TIMESTAMP = ""
+        ENABLE_WORKSPACE_CLEAN   = 'true'
+        ENABLE_ARCHIVE_ARTIFACTS = 'false'
 
-        // Python venv activation command (Windows Jenkins agent)
-        ACTIVATE = "venv\\Scripts\\activate.bat"
+        AUTOMATION_REPO_URL = 'https://gitlab.com/bhp-cloudfactory/waio-geomatics/waio-spatial-projects/automations/mtd_fms_minestar.git'
+        CONFIG_REPO_URL     = 'https://gitlab.com/bhp-cloudfactory/waio-geomatics/waio-spatial-projects/automations-config/mtd_fms_minestar_config.git'
+
+        AUTOMATION_BRANCH = 'NPE'
+        CONFIG_BRANCH     = 'NPE'
+        CONFIG_SPARSE_PATH = 'NPE'
+
+        AUTOMATION_DIR  = "${WORKSPACE}\\mtd_fms_minestar"
+        CONFIG_DIR      = "${WORKSPACE}\\mtd_fms_minestar\\config"
+        CONFIG_TEMP_DIR = "${WORKSPACE}\\config-repo-temp"
+
+        SITES = 'SF,MAC,MACAW,JBAH,BMM'
+
+        SKIP_MONITORING = 'true'
+        DRY_RUN = 'false'
     }
 
     stages {
-
-        // ----------------------------------------------------------------
-        // Bootstrap
-        // ----------------------------------------------------------------
-
-        stage('Setup') {
+        stage('Load Config Flags') {
             steps {
-                bat """
-                    if not exist venv python -m venv venv
-                    call ${ACTIVATE}
-                    python -m pip install --upgrade pip --quiet
-                    pip install -r requirements.txt --quiet
-                """
                 script {
-                    // Generate and export the shared run timestamp.
-                    // All parallel hourly site stages read FMS_RUN_TIMESTAMP
-                    // from the environment so they share one output folder.
-                    env.FMS_RUN_TIMESTAMP = new Date().format('yyyyMMddHHmmss')
-                    echo "DEPLOY_ENV    : ${env.DEPLOY_ENV}"
-                    echo "MODE          : ${params.MODE}"
-                    echo "RUN_TIMESTAMP : ${env.FMS_RUN_TIMESTAMP}"
+                    env.ENABLE_HOURLY          = 'true'
+                    env.ENABLE_HOURLY_FINALIZE = 'true'
+                    env.ENABLE_DAILY_MERGE     = 'false'
+                    env.ENABLE_DAILY_CLEANUP   = 'false'
+                    env.ENABLE_ARCHIVE         = 'false'
+                    env.ENABLE_WEEKLY          = 'false'
+
+                    echo "Config Flags Loaded:"
+                    echo "HOURLY = ${env.ENABLE_HOURLY}"
                 }
             }
         }
 
-        // ----------------------------------------------------------------
-        // MODE: hourly — parallel per-site processing + finalize
-        // ----------------------------------------------------------------
+        stage('Prepare Workspace') {
+            when {
+                expression {
+                    return env.ENABLE_WORKSPACE_CLEAN == 'true'
+                }
+            }
+            steps {
+                echo 'Cleaning workspace before cloning...'
 
-        stage('Hourly — Process Sites (Parallel)') {
-            when { expression { params.MODE == 'hourly' } }
+                cleanWs(
+                    deleteDirs: true,
+                    disableDeferredWipeout: true,
+                    notFailBuild: true
+                )
+            }
+        }
+
+        stage('Checkout Repositories') {
+            steps {
+                echo 'Checking out automation repository...'
+
+                dir('mtd_fms_minestar') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "*/${env.AUTOMATION_BRANCH}"]],
+                        userRemoteConfigs: [[
+                            url: env.AUTOMATION_REPO_URL,
+                            credentialsId: 'jenkins-waio-id'
+                        ]],
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption',
+                                noTags: true,
+                                shallow: true,
+                                depth: 1,
+                                timeout: 20
+                            ],
+                            [$class: 'CheckoutOption',
+                                timeout: 20
+                            ]
+                        ]
+                    ])
+                }
+
+                echo 'Checking out config repository into temporary folder...'
+
+                dir('config-repo-temp') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "*/${env.CONFIG_BRANCH}"]],
+                        userRemoteConfigs: [[
+                            url: env.CONFIG_REPO_URL,
+                            credentialsId: 'jenkins-waio-id'
+                        ]],
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption',
+                                noTags: true,
+                                shallow: true,
+                                depth: 1,
+                                timeout: 20
+                            ],
+                            [$class: 'CheckoutOption',
+                                timeout: 20
+                            ],
+                            [$class: 'SparseCheckoutPaths',
+                                sparseCheckoutPaths: [
+                                    [$class: 'SparseCheckoutPath', path: env.CONFIG_SPARSE_PATH]
+                                ]
+                            ]
+                        ]
+                    ])
+                }
+
+                bat """
+                    @echo off
+                    setlocal
+
+                    echo ==========================================
+                    echo Preparing flattened config folder
+                    echo ENV_NAME        = %ENV_NAME%
+                    echo AUTOMATION_DIR  = %AUTOMATION_DIR%
+                    echo CONFIG_TEMP_DIR = %CONFIG_TEMP_DIR%
+                    echo CONFIG_DIR      = %CONFIG_DIR%
+                    echo ==========================================
+
+                    if not exist "%AUTOMATION_DIR%" (
+                        echo [ERROR] Automation directory not found
+                        exit /b 1
+                    )
+
+                    if exist "%CONFIG_DIR%" (
+                        echo Removing existing final config folder...
+                        rmdir /s /q "%CONFIG_DIR%"
+                    )
+
+                    mkdir "%CONFIG_DIR%"
+
+                    if not exist "%CONFIG_TEMP_DIR%\\%CONFIG_SPARSE_PATH%" (
+                        echo [ERROR] Sparse config folder not found: %CONFIG_TEMP_DIR%\\%CONFIG_SPARSE_PATH%
+                        exit /b 1
+                    )
+
+                    echo Copying config files from temp repo to final config folder...
+                    xcopy "%CONFIG_TEMP_DIR%\\%CONFIG_SPARSE_PATH%\\*" "%CONFIG_DIR%\\" /E /I /Y
+
+                    if errorlevel 1 (
+                        echo [ERROR] Failed to copy config files
+                        exit /b 1
+                    )
+
+                    echo Removing temporary config repo...
+                    rmdir /s /q "%CONFIG_TEMP_DIR%"
+
+                    if not exist "%CONFIG_DIR%\\app_config.yaml" (
+                        echo [ERROR] app_config.yaml not found in final config folder
+                        exit /b 1
+                    )
+
+                    if not exist "%CONFIG_DIR%\\logging.yaml" (
+                        echo [ERROR] logging.yaml not found in final config folder
+                        exit /b 1
+                    )
+
+                    echo [SUCCESS] Final config folder prepared successfully
+                    dir "%CONFIG_DIR%"
+                """
+            }
+        }
+
+        stage('Setup Runtime') {
             steps {
                 script {
-                    def siteList = params.SITES.split(',').collect { it.trim() }.findAll { it }
-                    def parallelStages = [:]
+                    def perthTz = TimeZone.getTimeZone('Australia/Perth')
+                    def now = new Date()
 
-                    siteList.each { site ->
-                        def s = site  // capture for closure
-                        parallelStages["Site: ${s}"] = {
-                            bat """
-                                call ${ACTIVATE}
-                                set FMS_RUN_TIMESTAMP=${env.FMS_RUN_TIMESTAMP}
-                                python -m src.runners.fms_runner ^
-                                    --config ${params.CONFIG_PATH} ^
-                                    --logging ${params.LOGGING_PATH} ^
-                                    --site ${s} ^
-                                    --env ${env.DEPLOY_ENV} ^
-                                    ${params.SKIP_MONITORING ? '--skip-monitoring' : ''}
-                            """
+                    def RUN_MODE
+                    def FMS_RUN_TIMESTAMP = params.FMS_RUN_TIMESTAMP.trim()
+
+                    def hour = now.format('HH', perthTz) as Integer
+                    def minute = now.format('mm', perthTz) as Integer
+                    def dayOfWeek = now.format('u', perthTz) as Integer
+
+                    if (hour == 0 && minute == 0) {
+                        env.RUN_MODE = 'daily-merge'
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMdd', perthTz) : FMS_RUN_TIMESTAMP
+                    } else if (hour == 0 && minute == 30) {
+                        env.RUN_MODE = 'daily-cleanup'
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMdd', perthTz) : FMS_RUN_TIMESTAMP
+                    } else if (dayOfWeek == 7 && hour == 2 && minute == 30) {
+                        env.RUN_MODE = 'weekly-cleanup'
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHHmmss', perthTz) : FMS_RUN_TIMESTAMP
+                    } else if (hour == 23 && minute == 30) {
+                        env.RUN_MODE = 'archive'
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHHmmss', perthTz) : FMS_RUN_TIMESTAMP
+                    } else if (hour >= 1 && hour <= 23) {
+                        env.RUN_MODE = 'hourly'
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHH') + '0000' : FMS_RUN_TIMESTAMP
+                    } else {
+                        env.RUN_MODE = 'skip'
+                        env.FMS_RUN_TIMESTAMP = (FMS_RUN_TIMESTAMP == '') ? now.format('yyyyMMddHHmmss', perthTz) : FMS_RUN_TIMESTAMP
+                    }
+
+                    echo "RUN MODE          : ${env.RUN_MODE}"
+                    echo "ENV_NAME          : ${env.ENV_NAME}"
+                    echo "FMS_RUN_TIMESTAMP : ${env.FMS_RUN_TIMESTAMP}"
+                    echo "SITES             : ${env.SITES}"
+
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.RUN_MODE} ${env.ENV_NAME} ${env.FMS_RUN_TIMESTAMP}"
+                }
+            }
+        }
+
+        stage('Hourly -- Process Sites Parallel') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'hourly' && env.ENABLE_HOURLY == 'true'
+                }
+            }
+
+            steps {
+                script {
+                    def siteList = env.SITES
+                        .split(',')
+                        .collect { it.trim() }
+                        .findAll { it }
+
+                    def branches = [:]
+                    def forceArg = params.FMS_FORCE_DATE.trim()
+                        ? "--FMS_ForceDate ${params.FMS_FORCE_DATE.trim()}"
+                        : ""
+
+                    for (int i = 0; i < siteList.size(); i++) {
+                        def site = siteList[i]
+
+                        branches["Site ${site}"] = {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                bat """
+                                    @echo off
+                                    setlocal
+
+                                    echo ==========================================
+                                    echo Hourly FMS processing
+                                    echo ENV_NAME          = %ENV_NAME%
+                                    echo SITE              = ${site}
+                                    echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                                    echo Date              = %DATE% Time = %TIME%
+                                    echo ==========================================
+
+                                    if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+                                    if not exist "%WORKSPACE%\\logs" mkdir "%WORKSPACE%\\logs"
+
+                                    cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                                    set FMS_RUN_TIMESTAMP=%FMS_RUN_TIMESTAMP%
+
+                                    "%ArcPy3%" ^
+                                        -m src.runners.fms_runner ^
+                                        --config "%CONFIG_DIR%\\app_config.yaml" ^
+                                        --logging "%CONFIG_DIR%\\logging.yaml" ^
+                                        --site ${site} ^
+                                        --env "%ENV_NAME%" ^
+                                        --FMS_RunTimestamp "%FMS_RUN_TIMESTAMP%" ${env.SKIP_MONITORING == 'true' ? '--skip-monitoring' : ''} ${forceArg}
+
+                                    IF ERRORLEVEL 1 (
+                                        echo FAILED > "%WORKSPACE%\\site-status\\hourly-${site}.txt"
+                                        echo [ERROR] Hourly Python execution failed for site ${site}
+                                        exit /b 1
+                                    )
+
+                                    echo SUCCESS > "%WORKSPACE%\\site-status\\hourly-${site}.txt"
+                                    echo [SUCCESS] Hourly processing completed for site ${site}
+                                    exit /b 0
+                                """
+                            }
                         }
                     }
 
-                    // Fail the stage if ANY site fails (default Jenkins behaviour
-                    // for parallel is to continue; failFast stops remaining sites)
-                    parallelStages.failFast = false
-                    parallel parallelStages
+                    branches.failFast = false
+                    parallel branches
                 }
             }
         }
 
-        stage('Hourly — Finalize (Merge Boundaries + FME INGEST)') {
-            when { expression { params.MODE == 'hourly' } }
+        stage('Hourly -- Finalize Merge Boundaries + FME INGEST') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'hourly' && env.ENABLE_HOURLY_FINALIZE == 'true'
+                }
+            }
+
             steps {
-                bat """
-                    call ${ACTIVATE}
-                    set FMS_RUN_TIMESTAMP=${env.FMS_RUN_TIMESTAMP}
-                    python -m src.runners.fms_finalize_runner ^
-                        --config ${params.CONFIG_PATH} ^
-                        --logging ${params.LOGGING_PATH} ^
-                        --run-timestamp ${env.FMS_RUN_TIMESTAMP} ^
-                        --env ${env.DEPLOY_ENV}
-                """
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    bat """
+                        @echo off
+                        setlocal
+
+                        echo ==========================================
+                        echo Hourly Finalize Process
+                        echo ENV_NAME          = %ENV_NAME%
+                        echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                        echo Date              = %DATE% Time = %TIME%
+                        echo ==========================================
+
+                        if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+
+                        cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                        set FMS_RUN_TIMESTAMP=%FMS_RUN_TIMESTAMP%
+
+                        "%ArcPy3%" ^
+                            -m src.runners.fms_finalize_runner ^
+                            --config "%CONFIG_DIR%\\app_config.yaml" ^
+                            --logging "%CONFIG_DIR%\\logging.yaml" ^
+                            --run-timestamp "%FMS_RUN_TIMESTAMP%" ^
+                            --env "%ENV_NAME%"
+
+                        IF ERRORLEVEL 1 (
+                            echo FAILED > "%WORKSPACE%\\site-status\\hourly-finalize.txt"
+                            echo [ERROR] Hourly finalize failed
+                            exit /b 1
+                        )
+
+                        echo SUCCESS > "%WORKSPACE%\\site-status\\hourly-finalize.txt"
+                        echo [SUCCESS] Hourly finalize completed
+                        exit /b 0
+                    """
+                }
             }
         }
 
-        // ----------------------------------------------------------------
-        // MODE: daily-merge — mosaic hourly TIFFs + FME INGEST (Daily)
-        // ----------------------------------------------------------------
+        stage('Daily -- Merge Hourly TIFFs + FME INGEST') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'daily-merge' && env.ENABLE_DAILY_MERGE == 'true'
+                }
+            }
 
-        stage('Daily — Merge Hourly TIFFs + FME INGEST') {
-            when { expression { params.MODE == 'daily-merge' } }
             steps {
-                bat """
-                    call ${ACTIVATE}
-                    python -m src.runners.daily_merge_runner ^
-                        --config ${params.CONFIG_PATH} ^
-                        --logging ${params.LOGGING_PATH} ^
-                        --env ${env.DEPLOY_ENV}
-                """
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    bat """
+                        @echo off
+                        setlocal
+
+                        echo ==========================================
+                        echo Daily Merge Process
+                        echo ENV_NAME          = %ENV_NAME%
+                        echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                        echo Date              = %DATE% Time = %TIME%
+                        echo ==========================================
+
+                        if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+
+                        cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                        "%ArcPy3%" ^
+                            -m src.runners.daily_merge_runner ^
+                            --config "%CONFIG_DIR%\\app_config.yaml" ^
+                            --logging "%CONFIG_DIR%\\logging.yaml" ^
+                            --run-timestamp "%FMS_RUN_TIMESTAMP%" ^
+                            --env "%ENV_NAME%"
+
+                        IF ERRORLEVEL 1 (
+                            echo FAILED > "%WORKSPACE%\\site-status\\daily-merge.txt"
+                            echo [ERROR] Daily merge failed
+                            exit /b 1
+                        )
+
+                        echo SUCCESS > "%WORKSPACE%\\site-status\\daily-merge.txt"
+                        echo [SUCCESS] Daily merge completed
+                        exit /b 0
+                    """
+                }
             }
         }
 
-        // ----------------------------------------------------------------
-        // MODE: daily-cleanup — remove hourly surveys via FME DELETE
-        // ----------------------------------------------------------------
+        stage('Daily -- Cleanup Hourly Surveys FME DELETE') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'daily-cleanup' && env.ENABLE_DAILY_CLEANUP == 'true'
+                }
+            }
 
-        stage('Daily — Cleanup Hourly Surveys (FME DELETE)') {
-            when { expression { params.MODE == 'daily-cleanup' } }
             steps {
-                bat """
-                    call ${ACTIVATE}
-                    python -m src.runners.daily_cleanup_runner ^
-                        --config ${params.CONFIG_PATH} ^
-                        --logging ${params.LOGGING_PATH} ^
-                        --env ${env.DEPLOY_ENV}
-                """
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    bat """
+                        @echo off
+                        setlocal
+
+                        echo ==========================================
+                        echo Daily Cleanup Process
+                        echo ENV_NAME = %ENV_NAME%
+                        echo Date     = %DATE% Time = %TIME%
+                        echo ==========================================
+
+                        if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+
+                        cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                        "%ArcPy3%" ^
+                            -m src.runners.daily_cleanup_runner ^
+                            --config "%CONFIG_DIR%\\app_config.yaml" ^
+                            --logging "%CONFIG_DIR%\\logging.yaml" ^
+                            --env "%ENV_NAME%"
+
+                        IF ERRORLEVEL 1 (
+                            echo FAILED > "%WORKSPACE%\\site-status\\daily-cleanup.txt"
+                            echo [ERROR] Daily cleanup failed
+                            exit /b 1
+                        )
+
+                        echo SUCCESS > "%WORKSPACE%\\site-status\\daily-cleanup.txt"
+                        echo [SUCCESS] Daily cleanup completed
+                        exit /b 0
+                    """
+                }
             }
         }
 
-        // ----------------------------------------------------------------
-        // MODE: weekly — archive to blob + purge local file share
-        // ----------------------------------------------------------------
+        stage('Nightly -- Archive SNP Files') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'archive' && env.ENABLE_ARCHIVE == 'true'
+                }
+            }
 
-        stage('Weekly — Archive + Cleanup File Share') {
-            when { expression { params.MODE == 'weekly' } }
             steps {
-                bat """
-                    call ${ACTIVATE}
-                    python -m src.runners.weekly_cleanup_runner ^
-                        --config ${params.CONFIG_PATH} ^
-                        --logging ${params.LOGGING_PATH} ^
-                        --env ${env.DEPLOY_ENV} ^
-                        ${params.DRY_RUN ? '--dry-run' : ''}
-                """
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    bat """
+                        @echo off
+                        setlocal
+
+                        echo ==========================================
+                        echo Nightly Archive Process
+                        echo ENV_NAME = %ENV_NAME%
+                        echo DRY_RUN  = %DRY_RUN%
+                        echo Date     = %DATE% Time = %TIME%
+                        echo ==========================================
+
+                        if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+
+                        cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                        "%ArcPy3%" ^
+                            -m src.runners.archive_runner ^
+                            --config "%CONFIG_DIR%\\app_config.yaml" ^
+                            --logging "%CONFIG_DIR%\\logging.yaml" ^
+                            --env "%ENV_NAME%" ^
+                            ${env.DRY_RUN == 'true' ? '--dry-run' : ''}
+
+                        IF ERRORLEVEL 1 (
+                            echo FAILED > "%WORKSPACE%\\site-status\\archive.txt"
+                            echo [ERROR] Archive process failed
+                            exit /b 1
+                        )
+
+                        echo SUCCESS > "%WORKSPACE%\\site-status\\archive.txt"
+                        echo [SUCCESS] Archive process completed
+                        exit /b 0
+                    """
+                }
             }
         }
 
-    } // end stages
+        stage('Weekly -- Archive Old Daily Folders To Azure Blob') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'weekly-cleanup' && env.ENABLE_WEEKLY == 'true'
+                }
+            }
+
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    bat """
+                        @echo off
+                        setlocal
+
+                        echo ==========================================
+                        echo Weekly Cleanup Process
+                        echo ENV_NAME = %ENV_NAME%
+                        echo DRY_RUN  = %DRY_RUN%
+                        echo Date     = %DATE% Time = %TIME%
+                        echo ==========================================
+
+                        if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+
+                        cd /d "%AUTOMATION_DIR%" || exit /b 1
+
+                        "%ArcPy3%" ^
+                            -m src.runners.weekly_cleanup_runner ^
+                            --config "%CONFIG_DIR%\\app_config.yaml" ^
+                            --logging "%CONFIG_DIR%\\logging.yaml" ^
+                            --env "%ENV_NAME%" ^
+                            ${env.DRY_RUN == 'true' ? '--dry-run' : ''}
+
+                        IF ERRORLEVEL 1 (
+                            echo FAILED > "%WORKSPACE%\\site-status\\weekly-cleanup.txt"
+                            echo [ERROR] Weekly cleanup failed
+                            exit /b 1
+                        )
+
+                        echo SUCCESS > "%WORKSPACE%\\site-status\\weekly-cleanup.txt"
+                        echo [SUCCESS] Weekly cleanup completed
+                        exit /b 0
+                    """
+                }
+            }
+        }
+
+        stage('Dashboard Summary') {
+            steps {
+                script {
+                    def summaryLines = []
+
+                    summaryLines << "FMS Live Surface Summary"
+                    summaryLines << "Mode: ${env.RUN_MODE}"
+                    summaryLines << "Environment: ${env.ENV_NAME}"
+                    summaryLines << "Run Timestamp: ${env.FMS_RUN_TIMESTAMP}"
+                    summaryLines << "Build: ${env.BUILD_NUMBER}"
+                    summaryLines << "--------------------------------"
+
+                    if (env.RUN_MODE == 'hourly') {
+                        def siteList = env.SITES
+                            .split(',')
+                            .collect { it.trim() }
+                            .findAll { it }
+
+                        for (site in siteList) {
+                            def statusFile = "site-status/hourly-${site}.txt"
+                            def status = fileExists(statusFile)
+                                ? readFile(statusFile).trim()
+                                : 'NOT_RUN'
+
+                            def icon = '⚪'
+
+                            if (status == 'SUCCESS') {
+                                icon = '✅'
+                            } else if (status == 'FAILED') {
+                                icon = '❌'
+                                currentBuild.result = 'UNSTABLE'
+                            } else {
+                                icon = '⚠️'
+                            }
+
+                            summaryLines << "${icon} Hourly ${site}: ${status}"
+                        }
+
+                        def finalizeStatusFile = "site-status/hourly-finalize.txt"
+                        def finalizeStatus = fileExists(finalizeStatusFile)
+                            ? readFile(finalizeStatusFile).trim()
+                            : 'NOT_RUN'
+
+                        def finalizeIcon = '⚪'
+
+                        if (finalizeStatus == 'SUCCESS') {
+                            finalizeIcon = '✅'
+                        } else if (finalizeStatus == 'FAILED') {
+                            finalizeIcon = '❌'
+                            currentBuild.result = 'UNSTABLE'
+                        } else {
+                            finalizeIcon = '⚠️'
+                        }
+
+                        summaryLines << "${finalizeIcon} Hourly Finalize: ${finalizeStatus}"
+                    } else {
+                        def statusFile = "site-status/${env.RUN_MODE}.txt"
+                        def status = fileExists(statusFile)
+                            ? readFile(statusFile).trim()
+                            : 'NOT_RUN'
+
+                        def icon = '⚪'
+
+                        if (status == 'SUCCESS') {
+                            icon = '✅'
+                        } else if (status == 'FAILED') {
+                            icon = '❌'
+                            currentBuild.result = 'UNSTABLE'
+                        } else {
+                            icon = '⚠️'
+                        }
+
+                        summaryLines << "${icon} ${env.RUN_MODE}: ${status}"
+                    }
+
+                    def summaryText = summaryLines.join('\n')
+                    echo summaryText
+
+                    // Keep build description plain text because Jenkins may not render HTML here
+                    currentBuild.description = summaryLines.join(' | ')
+                }
+            }
+        }
+    }
 
     post {
         always {
-            archiveArtifacts artifacts: 'logs/*.log', allowEmptyArchive: true
+            script {
+                if (env.ENABLE_ARCHIVE_ARTIFACTS == 'true') {
+                    archiveArtifacts artifacts: 'logs/*.log, site-status/*.txt', allowEmptyArchive: true
+                } else {
+                    echo 'Artifact archive is currently disabled.'
+                }
+            }
         }
-        success {
-            echo "Pipeline [${params.MODE}] completed successfully on ${env.DEPLOY_ENV}"
+
+        unstable {
+            mail(
+                to: 'arish.pathak@bhp.com',
+                subject: '[JENKINS UNSTABLE] FMS Live Surface -- ${env.MODE} -- ${env.ENV_NAME}',
+                body: """
+FMS Live Surface pipeline completed as UNSTABLE.
+
+Mode        : ${env.RUN_MODE}
+Environment : ${env.ENV_NAME}
+Timestamp   : ${env.FMS_RUN_TIMESTAMP}
+Build URL   : ${env.BUILD_URL}
+
+Check dashboard summary and logs for details.
+"""
+            )
         }
+
         failure {
             mail(
-                to: 'gis-alerts@waio.bhp.com',
-                subject: "[JENKINS FAILURE] FMS Live Surface — ${params.MODE} — ${env.DEPLOY_ENV}",
+                to: 'grish.pathak@bhp.com',
+                subject: '[JENKINS FAILURE] FMS Live Surface -- ${env.RUN_MODE} -- ${env.ENV_NAME}',
                 body: """
 FMS Live Surface pipeline failed.
 
-Mode       : ${params.MODE}
-Environment: ${env.DEPLOY_ENV}
-Timestamp  : ${env.FMS_RUN_TIMESTAMP}
-Build URL  : ${env.BUILD_URL}
+Mode        : ${env.RUN_MODE}
+Environment : ${env.ENV_NAME}
+Timestamp   : ${env.FMS_RUN_TIMESTAMP}
+Build URL   : ${env.BUILD_URL}
 
 Check the build logs for details.
 """

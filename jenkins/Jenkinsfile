@@ -1,182 +1,230 @@
 // =============================================================================
-// FMS Live Surface — Jenkins Declarative Pipeline
-//
-// Single pipeline for both hourly and daily runs:
-//   - 00:00–00:59 AM  →  DAILY path  (daily_merge_runner)
-//   - 01:00–23:59     →  HOURLY path (parallel site runners + finalize)
-//
-// Jenkins global variables required:
-//   ArcPy3       — full path to ArcGIS Pro Python executable
-//                  e.g. C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe
-//   ENV          — deployment environment label  (NPE | PROD)
-//
-// Credentials required (Manage Jenkins > Credentials):
-//   GITLAB_TOKEN — Secret text: GitLab personal access token
-//
-// To add a new mine site: append its code to FMS_SITES below. No other changes needed.
+// FMS Live Surface — Unified Jenkins Pipeline
 // =============================================================================
-
-// ── Site list ─────────────────────────────────────────────────────────────────
-def FMS_SITES = ['WB', 'ER', 'SF', 'YND', 'JB', 'NWW', 'MAC']
+//
+// This single Jenkinsfile drives all four FMS automation workflows.
+// Create four separate Jenkins Pipeline jobs (one per mode), each pointing
+// at this file in SCM and setting the MODE parameter as its default value.
+//
+//  Job name                 | MODE            | Trigger
+//  -------------------------|-----------------|---------------------------
+//  FMS-Hourly               | hourly          | cron('H * * * *')
+//  FMS-Daily-Merge          | daily-merge     | cron('30 0 * * *')
+//  FMS-Daily-Cleanup        | daily-cleanup   | cron('0 1 * * *')
+//  FMS-Weekly-Cleanup       | weekly          | cron('0 2 * * 0')
+//
+// ENVIRONMENT:
+//   DEPLOY_ENV is read from Jenkins Global Properties (Manage Jenkins →
+//   System → Global properties → Environment variables).
+//   Set DEPLOY_ENV=NPE on the NPE controller and DEPLOY_ENV=PROD on PROD.
+//   No need to pass it as a build parameter — it is injected automatically.
+//
+// SITES:
+//   All 7 mine sites run in parallel for MODE=hourly.  To run a subset
+//   during testing, override the SITES parameter when triggering manually.
+// =============================================================================
 
 pipeline {
     agent any
 
-    // Runs every hour at 15 past. Adjust the minute to suit your schedule.
-    triggers { cron('15 * * * *') }
-
     parameters {
+        choice(
+            name: 'MODE',
+            choices: ['hourly', 'daily-merge', 'daily-cleanup', 'weekly'],
+            description: 'Pipeline mode to execute'
+        )
         string(
-            name: 'FMS_FORCE_DATE',
-            defaultValue: '',
-            description: 'Optional: Force a specific processing date (YYYYMMDD). Leave blank to use today. Used for manual reruns of a past date.'
+            name: 'SITES',
+            defaultValue: 'WB,ER,SF,YND,JB,NWW,MAC',
+            description: 'Comma-separated site codes for hourly mode'
+        )
+        string(
+            name: 'CONFIG_PATH',
+            defaultValue: 'config/app_config.yaml',
+            description: 'App config YAML path'
+        )
+        string(
+            name: 'LOGGING_PATH',
+            defaultValue: 'config/logging.prod.yaml',
+            description: 'Logging config YAML path'
+        )
+        booleanParam(
+            name: 'SKIP_MONITORING',
+            defaultValue: false,
+            description: 'Skip file delivery monitoring check (hourly only)'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: false,
+            description: 'Dry-run mode (weekly cleanup only — no uploads/deletes)'
         )
     }
 
     environment {
-        // ── Repo URLs — update with actual GitLab paths before go-live ────────
-        CONFIG_REPO_URL     = 'https://gitlab.example.com/waio/fms-config.git'
-        AUTOMATION_REPO_URL = 'https://gitlab.example.com/waio/fms-live-surface.git'
+        // DEPLOY_ENV is set in Jenkins Global Properties — do not hardcode here.
+        // Fallback to 'NPE' keeps NPE jobs safe if the variable is ever unset.
+        DEPLOY_ENV = "${env.DEPLOY_ENV ?: 'NPE'}"
 
-        // ── Derived from Jenkins global variables ─────────────────────────────
-        // %ArcPy3%   is referenced directly in bat steps
-        // %ENV%      is referenced directly in bat steps
-        // Both are set in Manage Jenkins > Configure System > Global properties
+        // Shared run timestamp: set once in the 'Setup' stage so that all
+        // parallel site stages write into the same FMS_<timestamp> folder.
+        FMS_RUN_TIMESTAMP = ""
+
+        // Python venv activation command (Windows Jenkins agent)
+        ACTIVATE = "venv\\Scripts\\activate.bat"
     }
 
     stages {
 
-        // ── Stage 1: Determine run mode and compute shared timestamp ──────────
-        stage('Determine Run Mode') {
+        // ----------------------------------------------------------------
+        // Bootstrap
+        // ----------------------------------------------------------------
+
+        stage('Setup') {
             steps {
+                bat """
+                    if not exist venv python -m venv venv
+                    call ${ACTIVATE}
+                    python -m pip install --upgrade pip --quiet
+                    pip install -r requirements.txt --quiet
+                """
                 script {
-                    def now     = new Date()
-                    def hour    = now.format('H').toInteger()
-                    def hourStr = now.format('HH')
-
-                    // Use FMS_FORCE_DATE if provided, otherwise today's date
-                    def baseDate = params.FMS_FORCE_DATE?.trim() ?: now.format('yyyyMMdd')
-
-                    // Shared run timestamp passed to all site runners and finalize
-                    env.RUN_TIMESTAMP = "${baseDate}${hourStr}0000"
-
-                    // 00:00–00:59 AM → daily merge; all other hours → hourly pipeline
-                    env.IS_DAILY = (hour == 0) ? 'true' : 'false'
-
-                    echo "Mode         : ${env.IS_DAILY == 'true' ? 'DAILY' : 'HOURLY'}"
-                    echo "Run timestamp: ${env.RUN_TIMESTAMP}"
-                    echo "Force date   : ${params.FMS_FORCE_DATE ?: '(none)'}"
+                    // Generate and export the shared run timestamp.
+                    // All parallel hourly site stages read FMS_RUN_TIMESTAMP
+                    // from the environment so they share one output folder.
+                    env.FMS_RUN_TIMESTAMP = new Date().format('yyyyMMddHHmmss')
+                    echo "DEPLOY_ENV    : ${env.DEPLOY_ENV}"
+                    echo "MODE          : ${params.MODE}"
+                    echo "RUN_TIMESTAMP : ${env.FMS_RUN_TIMESTAMP}"
                 }
             }
         }
 
-        // ── Stage 2: Clean workspace ──────────────────────────────────────────
-        // Requires the Jenkins "Workspace Cleanup" plugin
-        stage('Clean Workspace') {
-            steps { cleanWs() }
-        }
+        // ----------------------------------------------------------------
+        // MODE: hourly — parallel per-site processing + finalize
+        // ----------------------------------------------------------------
 
-        // ── Stage 3: Clone repositories ───────────────────────────────────────
-        // Config repo: use NPE/ sub-folder for config files
-        // Automation repo: FMS Live Surface Python pipeline
-        stage('Clone Repositories') {
+        stage('Hourly — Process Sites (Parallel)') {
+            when { expression { params.MODE == 'hourly' } }
             steps {
                 script {
-                    withCredentials([string(credentialsId: 'GITLAB_TOKEN', variable: 'TOKEN')]) {
-                        // Strip protocol to inject the token between https:// and the host
-                        def configHost     = env.CONFIG_REPO_URL.replace('https://', '')
-                        def automationHost = env.AUTOMATION_REPO_URL.replace('https://', '')
+                    def siteList = params.SITES.split(',').collect { it.trim() }.findAll { it }
+                    def parallelStages = [:]
 
-                        bat "git clone --depth 1 https://oauth2:%TOKEN%@${configHost} config_repo"
-                        bat "git clone --depth 1 https://oauth2:%TOKEN%@${automationHost} automation"
-                    }
-                }
-            }
-        }
-
-        // ── Stage 4: Hourly — parallel site pipelines ─────────────────────────
-        // Each site runs fms_runner independently. failFast=false so one site
-        // failure does not cancel the others.
-        stage('Run Site Pipelines') {
-            when { expression { env.IS_DAILY == 'false' } }
-            steps {
-                script {
-                    def parallelStages = [failFast: false]
-
-                    // Common CLI fragments reused by every site
-                    def configArgs  = "--config ..\\config_repo\\NPE\\app_config.yaml" +
-                                      " --logging ..\\config_repo\\NPE\\logging.yaml"
-                    def forceArg    = params.FMS_FORCE_DATE?.trim()
-                                      ? " --FMS_ForceDate ${params.FMS_FORCE_DATE.trim()}"
-                                      : ''
-
-                    FMS_SITES.each { site ->
-                        def s = site  // capture loop variable for closure
-                        parallelStages[s] = {
-                            dir('automation') {
-                                bat "\"%ArcPy3%\" -m src.runners.fms_runner" +
-                                    " ${configArgs}" +
-                                    " --site ${s}" +
-                                    " --env %ENV%" +
-                                    " --FMS_RunTimestamp %RUN_TIMESTAMP%" +
-                                    forceArg
-                            }
+                    siteList.each { site ->
+                        def s = site  // capture for closure
+                        parallelStages["Site: ${s}"] = {
+                            bat """
+                                call ${ACTIVATE}
+                                set FMS_RUN_TIMESTAMP=${env.FMS_RUN_TIMESTAMP}
+                                python -m src.runners.fms_runner ^
+                                    --config ${params.CONFIG_PATH} ^
+                                    --logging ${params.LOGGING_PATH} ^
+                                    --site ${s} ^
+                                    --env ${env.DEPLOY_ENV} ^
+                                    ${params.SKIP_MONITORING ? '--skip-monitoring' : ''}
+                            """
                         }
                     }
 
+                    // Fail the stage if ANY site fails (default Jenkins behaviour
+                    // for parallel is to continue; failFast stops remaining sites)
+                    parallelStages.failFast = false
                     parallel parallelStages
                 }
             }
         }
 
-        // ── Stage 5: Hourly — finalize (merge boundaries + FME INGEST) ────────
-        // Runs once after ALL parallel site stages have completed.
-        stage('Finalize') {
-            when { expression { env.IS_DAILY == 'false' } }
+        stage('Hourly — Finalize (Merge Boundaries + FME INGEST)') {
+            when { expression { params.MODE == 'hourly' } }
             steps {
-                script {
-                    dir('automation') {
-                        bat "\"%ArcPy3%\" -m src.runners.fms_finalize_runner" +
-                            " --config ..\\config_repo\\NPE\\app_config.yaml" +
-                            " --logging ..\\config_repo\\NPE\\logging.yaml" +
-                            " --run-timestamp %RUN_TIMESTAMP%" +
-                            " --env %ENV%"
-                    }
-                }
+                bat """
+                    call ${ACTIVATE}
+                    set FMS_RUN_TIMESTAMP=${env.FMS_RUN_TIMESTAMP}
+                    python -m src.runners.fms_finalize_runner ^
+                        --config ${params.CONFIG_PATH} ^
+                        --logging ${params.LOGGING_PATH} ^
+                        --run-timestamp ${env.FMS_RUN_TIMESTAMP} ^
+                        --env ${env.DEPLOY_ENV}
+                """
             }
         }
 
-        // ── Stage 6: Daily — mosaic hourly TIFFs + FME INGEST daily ──────────
-        // Triggered only in the 00:00–00:59 AM window.
-        // Mosaics all hourly FMS_<date>HH0000/ outputs into FMS_<date>/ then
-        // calls FME INGEST (SITE=Daily) and deletes the hourly folders.
-        stage('Daily Merge') {
-            when { expression { env.IS_DAILY == 'true' } }
+        // ----------------------------------------------------------------
+        // MODE: daily-merge — mosaic hourly TIFFs + FME INGEST (Daily)
+        // ----------------------------------------------------------------
+
+        stage('Daily — Merge Hourly TIFFs + FME INGEST') {
+            when { expression { params.MODE == 'daily-merge' } }
             steps {
-                script {
-                    dir('automation') {
-                        def forceArg = params.FMS_FORCE_DATE?.trim()
-                                       ? " --FMS_ForceDate ${params.FMS_FORCE_DATE.trim()}"
-                                       : ''
-                        bat "\"%ArcPy3%\" -m src.runners.daily_merge_runner" +
-                            " --config ..\\config_repo\\NPE\\app_config.yaml" +
-                            " --logging ..\\config_repo\\NPE\\logging.yaml" +
-                            " --env %ENV%" +
-                            forceArg
-                    }
-                }
+                bat """
+                    call ${ACTIVATE}
+                    python -m src.runners.daily_merge_runner ^
+                        --config ${params.CONFIG_PATH} ^
+                        --logging ${params.LOGGING_PATH} ^
+                        --env ${env.DEPLOY_ENV}
+                """
             }
         }
-    }
+
+        // ----------------------------------------------------------------
+        // MODE: daily-cleanup — remove hourly surveys via FME DELETE
+        // ----------------------------------------------------------------
+
+        stage('Daily — Cleanup Hourly Surveys (FME DELETE)') {
+            when { expression { params.MODE == 'daily-cleanup' } }
+            steps {
+                bat """
+                    call ${ACTIVATE}
+                    python -m src.runners.daily_cleanup_runner ^
+                        --config ${params.CONFIG_PATH} ^
+                        --logging ${params.LOGGING_PATH} ^
+                        --env ${env.DEPLOY_ENV}
+                """
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // MODE: weekly — archive to blob + purge local file share
+        // ----------------------------------------------------------------
+
+        stage('Weekly — Archive + Cleanup File Share') {
+            when { expression { params.MODE == 'weekly' } }
+            steps {
+                bat """
+                    call ${ACTIVATE}
+                    python -m src.runners.weekly_cleanup_runner ^
+                        --config ${params.CONFIG_PATH} ^
+                        --logging ${params.LOGGING_PATH} ^
+                        --env ${env.DEPLOY_ENV} ^
+                        ${params.DRY_RUN ? '--dry-run' : ''}
+                """
+            }
+        }
+
+    } // end stages
 
     post {
-        failure {
-            echo "FMS pipeline FAILED — ${env.JOB_NAME} #${env.BUILD_NUMBER} " +
-                 "(Mode: ${env.IS_DAILY == 'true' ? 'DAILY' : 'HOURLY'}, " +
-                 "Timestamp: ${env.RUN_TIMESTAMP})"
-        }
         always {
-            cleanWs()
+            archiveArtifacts artifacts: 'logs/*.log', allowEmptyArchive: true
+        }
+        success {
+            echo "Pipeline [${params.MODE}] completed successfully on ${env.DEPLOY_ENV}"
+        }
+        failure {
+            mail(
+                to: 'gis-alerts@waio.bhp.com',
+                subject: "[JENKINS FAILURE] FMS Live Surface — ${params.MODE} — ${env.DEPLOY_ENV}",
+                body: """
+FMS Live Surface pipeline failed.
+
+Mode       : ${params.MODE}
+Environment: ${env.DEPLOY_ENV}
+Timestamp  : ${env.FMS_RUN_TIMESTAMP}
+Build URL  : ${env.BUILD_URL}
+
+Check the build logs for details.
+"""
+            )
         }
     }
 }
