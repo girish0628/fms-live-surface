@@ -50,9 +50,12 @@ python -m src.runners.archive_runner \
     --config config/app_config.yaml \
     --logging config/logging.yaml \
     --env DEV \
+    --destination blob \
     [--site WB] \
-    [--dry-run]
+    [--dry-run] \
+    [--FMS_ForceDate YYYYMMDD]
 ```
+ZIP options (compression, chunking, files-per-chunk) are set in `config/app_config.yaml` under the `archive` section.
 
 ### Test, lint, type-check
 ```bash
@@ -118,7 +121,13 @@ The entire staging run folder is **deleted by fms_finalize_runner** after the FM
    - Calls FME INGEST webhook (SITE=Daily).
    - Deletes all hourly `FMS_<date>HH0000/` folders.
 
-4. **`archive_runner.py`** — Nightly. Zips `.snp` files under `<archive_root>/<site>/<YYYY>/<MM>/` then clears the landing zone.
+4. **`archive_runner.py`** — Nightly. Zips input files for each site under `<archive_root>/<site>/<YYYYMMDD>/` then clears the landing zone.
+   - Minestar sites (WB, ER, YND, MAC): archives `*<YYYYMMDD>*.snp`
+   - Modular sites (SF, JB, NWW): archives `*<YYYYMMDD>*.csv`
+   - Uses `zipfile` with ZIP_STORED (no compression) for maximum speed on large file counts.
+   - Supports chunked output (`--enable-chunking`): splits into `_part_001.zip`, `_part_002.zip`, etc.
+   - `--FMS_ForceDate YYYYMMDD` overrides the date used for both file matching and archive naming; defaults to today.
+   - Destinations: `network` (zip to share), `blob` (upload to Azure, no local file kept), `both`.
 
 Additional runners:
 - **`daily_cleanup_runner.py`** — Queries MTD mosaic for SITE='Hourly' surveys and deletes them via FME DELETE webhook.
@@ -187,7 +196,15 @@ result = svc.convert()  # returns dict[str, Any]
 - `publishing` — `integration_mode`, `fme_webhook_url`, `fme_token_env_var`, `api_module`, `poll_interval`, `poll_timeout`
 - `fme` — `ingest_url`, `delete_url`, `token_env_var`, `timeout`, `max_retries`, `user_email`
 - `mosaic` — MTD mosaic dataset path and field names (used by daily_cleanup_runner)
-- `blob_storage` — Azure Blob credentials env var and container (used by weekly_cleanup_runner)
+- `archive` — nightly archive settings:
+  - `destination`: `network` | `blob` | `both`
+  - `blob_prefix`: virtual folder prefix inside the blob container (e.g. `fms-snippets/`)
+  - `compression_method`: `stored` (default, fastest) or `deflated`
+  - `compress_level`: 1–9, only used when `deflated`
+  - `enable_chunking`: split into multiple ZIP parts (default `false`)
+  - `files_per_chunk`: max files per ZIP part (default `5000`)
+  - `delete_local_zip_after_upload`: remove local ZIP after blob upload when destination=`both` (default `false`)
+- `blob_storage` — Azure Blob credentials env var and container (used by archive_runner and weekly_cleanup_runner); connection string set via `AZURE_STORAGE_CONNECTION_STRING` env var
 - `weekly.output_retention_days` — how many days of daily folders to keep before blob archival
 
 Use `config/logging.yaml` for DEV (DEBUG, console + rotating file), `config/logging.prod.yaml` for PROD (INFO, rotating files only).

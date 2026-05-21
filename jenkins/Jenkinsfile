@@ -30,7 +30,7 @@ pipeline {
     parameters {
         choice(
             name: 'MODE',
-            choices: ['hourly', 'daily-merge', 'daily-cleanup', 'weekly'],
+            choices: ['hourly', 'daily-merge', 'daily-cleanup', 'weekly', 'archive'],
             description: 'Pipeline mode to execute'
         )
         string(
@@ -56,7 +56,18 @@ pipeline {
         booleanParam(
             name: 'DRY_RUN',
             defaultValue: false,
-            description: 'Dry-run mode (weekly cleanup only — no uploads/deletes)'
+            description: 'Dry-run mode — log what would happen without modifying files'
+        )
+        string(
+            name: 'FMS_FORCE_DATE',
+            defaultValue: '',
+            description: 'Optional: Force a specific date (YYYYMMDD). Used by archive and daily-merge modes. Leave blank to use today.'
+        )
+        // ── Archive parameters — ZIP options are configured in app_config.yaml ──
+        choice(
+            name: 'ARCHIVE_DESTINATION',
+            choices: ['blob', 'network', 'both'],
+            description: 'Archive destination: Azure Blob only, network share only, or both.'
         )
     }
 
@@ -198,6 +209,33 @@ pipeline {
                         --env ${env.DEPLOY_ENV} ^
                         ${params.DRY_RUN ? '--dry-run' : ''}
                 """
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // MODE: archive — nightly .snp/.csv input file archival
+        // Minestar sites (WB,ER,YND,MAC): archives *<date>*.snp
+        // Modular  sites (SF,JB,NWW):     archives *<date>*.csv
+        // ----------------------------------------------------------------
+
+        stage('Nightly — Archive Input Files') {
+            when { expression { params.MODE == 'archive' } }
+            steps {
+                script {
+                    def forceDate = params.FMS_FORCE_DATE?.trim()
+                                      ? "--FMS_ForceDate ${params.FMS_FORCE_DATE.trim()}" : ""
+                    def dryRun    = params.DRY_RUN ? "--dry-run" : ""
+
+                    bat """
+                        call ${ACTIVATE}
+                        python -m src.runners.archive_runner ^
+                            --config ${params.CONFIG_PATH} ^
+                            --logging ${params.LOGGING_PATH} ^
+                            --env ${env.DEPLOY_ENV} ^
+                            --destination "${params.ARCHIVE_DESTINATION}" ^
+                            ${forceDate} ${dryRun}
+                    """
+                }
             }
         }
 

@@ -31,6 +31,12 @@ pipeline {
             defaultValue: '',
             description: 'Optional: Force a specific processing date (YYYYMMDD). Leave blank to use today. Used for manual reruns of a past date.'
         )
+        // ── Archive parameters — ZIP options are configured in app_config.yaml ──
+        choice(
+            name: 'ARCHIVE_DESTINATION',
+            choices: ['blob', 'network', 'both'],
+            description: 'Archive destination: Azure Blob only, network share only, or both.'
+        )
     }
 
     environment {
@@ -60,10 +66,15 @@ pipeline {
                     // Shared run timestamp passed to all site runners and finalize
                     env.RUN_TIMESTAMP = "${baseDate}${hourStr}0000"
 
-                    // 00:00–00:59 AM → daily merge; all other hours → hourly pipeline
-                    env.IS_DAILY = (hour == 0) ? 'true' : 'false'
+                    // 00:00–00:59 AM → daily merge; 23:30 → archive; all other hours → hourly
+                    env.IS_DAILY    = (hour == 0)                      ? 'true' : 'false'
+                    env.IS_ARCHIVE  = (hour == 23 && now.format('mm').toInteger() >= 30) ? 'true' : 'false'
 
-                    echo "Mode         : ${env.IS_DAILY == 'true' ? 'DAILY' : 'HOURLY'}"
+                    def mode = env.IS_DAILY == 'true' ? 'DAILY'
+                             : env.IS_ARCHIVE == 'true' ? 'ARCHIVE'
+                             : 'HOURLY'
+
+                    echo "Mode         : ${mode}"
                     echo "Run timestamp: ${env.RUN_TIMESTAMP}"
                     echo "Force date   : ${params.FMS_FORCE_DATE ?: '(none)'}"
                 }
@@ -162,6 +173,29 @@ pipeline {
                             " --config ..\\config_repo\\NPE\\app_config.yaml" +
                             " --logging ..\\config_repo\\NPE\\logging.yaml" +
                             " --env %ENV%" +
+                            forceArg
+                    }
+                }
+            }
+        }
+
+        // ── Stage 7: Nightly — archive .snp / .csv input files ───────────────
+        // Minestar sites (WB,ER,YND,MAC): archives *<date>*.snp
+        // Modular  sites (SF,JB,NWW):     archives *<date>*.csv
+        // Triggered manually or via a separate nightly job at 23:30.
+        stage('Archive Input Files') {
+            when { expression { env.IS_ARCHIVE == 'true' } }
+            steps {
+                script {
+                    dir('automation') {
+                        def forceArg = params.FMS_FORCE_DATE?.trim()
+                                         ? " --FMS_ForceDate ${params.FMS_FORCE_DATE.trim()}" : ''
+
+                        bat "\"%ArcPy3%\" -m src.runners.archive_runner" +
+                            " --config ..\\config_repo\\NPE\\app_config.yaml" +
+                            " --logging ..\\config_repo\\NPE\\logging.yaml" +
+                            " --env %ENV%" +
+                            " --destination ${params.ARCHIVE_DESTINATION}" +
                             forceArg
                     }
                 }

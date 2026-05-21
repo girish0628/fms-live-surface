@@ -166,14 +166,28 @@ mosaic:
 # ------------------------------------------------------------------
 archive:
   # Destination for archived zip files: network | blob | both
-  # Can be overridden at runtime with the --destination CLI argument
-  # or the ARCHIVE_DESTINATION Jenkins pipeline parameter.
+  # Can be overridden at runtime with the --destination CLI argument.
   destination: "network"
 
-  # Virtual folder prefix inside the blob container for snippet archives.
-  # Zip files land at: {blob_prefix}{site}/{YYYY}/{MM}/{archive_name}.zip
-  # e.g. fms-snippets/WB/2026/05/WB_snippets_20260519_233000.zip
+  # Virtual folder prefix inside the blob container.
+  # Zips land at: {blob_prefix}{site}/{YYYYMMDD}/{archive_name}.zip
+  # e.g. fms-snippets/WB/20260521/WB_snippets_20260521_233000.zip
   blob_prefix: "fms-snippets/"
+
+  # ZIP compression: stored (no compression, fastest) or deflated
+  compression_method: "stored"
+
+  # Compression level 1-9, only used when compression_method=deflated
+  compress_level: 1
+
+  # Split into multiple ZIP files when file count is large
+  enable_chunking: false
+
+  # Max files per ZIP part when enable_chunking=true
+  files_per_chunk: 5000
+
+  # When destination=both, delete the local network ZIP after blob upload
+  delete_local_zip_after_upload: false
 
 # ------------------------------------------------------------------
 # Azure Blob Storage — weekly archival + snippet archive (blob/both)

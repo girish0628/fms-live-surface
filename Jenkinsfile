@@ -19,8 +19,8 @@ pipeline {
 
         choice(
             name: 'ARCHIVE_DESTINATION',
-            choices: ['network', 'blob', 'both'],
-            description: 'Destination for nightly snippet archive: network share only, Azure Blob only, or both.'
+            choices: ['blob', 'network', 'both'],
+            description: 'Destination for nightly input file archive: Azure Blob only, network share only, or both. All other ZIP options (compression, chunking) are set in app_config.yaml.'
         )
     }
 
@@ -513,7 +513,7 @@ pipeline {
             }
         }
 
-        stage('Nightly -- Archive SNP Files') {
+        stage('Nightly -- Archive Input Files') {
             when {
                 expression {
                     return env.RUN_MODE == 'archive' && env.ENABLE_ARCHIVE == 'true'
@@ -522,39 +522,46 @@ pipeline {
 
             steps {
                 catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                    bat """
-                        @echo off
-                        setlocal
+                    script {
+                        def forceDate = params.FMS_FORCE_DATE?.trim()
+                                          ? "--FMS_ForceDate ${params.FMS_FORCE_DATE.trim()}" : ""
+                        def dryRun    = env.DRY_RUN == 'true' ? "--dry-run" : ""
 
-                        echo ==========================================
-                        echo Nightly Archive Process
-                        echo ENV_NAME = %ENV_NAME%
-                        echo DRY_RUN  = %DRY_RUN%
-                        echo Date     = %DATE% Time = %TIME%
-                        echo ==========================================
+                        bat """
+                            @echo off
+                            setlocal
 
-                        if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
+                            echo ==========================================
+                            echo Nightly Archive Process
+                            echo ENV_NAME       = %ENV_NAME%
+                            echo DESTINATION    = ${params.ARCHIVE_DESTINATION}
+                            echo FMS_FORCE_DATE = ${params.FMS_FORCE_DATE ?: '(today)'}
+                            echo DRY_RUN        = %DRY_RUN%
+                            echo Date           = %DATE% Time = %TIME%
+                            echo ==========================================
 
-                        cd /d "%AUTOMATION_DIR%" || exit /b 1
+                            if not exist "%WORKSPACE%\\site-status" mkdir "%WORKSPACE%\\site-status"
 
-                        "%ArcPy3%" ^
-                            -m src.runners.archive_runner ^
-                            --config "%CONFIG_DIR%\\app_config.yaml" ^
-                            --logging "%CONFIG_DIR%\\logging.yaml" ^
-                            --env "%ENV_NAME%" ^
-                            --destination "${params.ARCHIVE_DESTINATION}" ^
-                            ${env.DRY_RUN == 'true' ? '--dry-run' : ''}
+                            cd /d "%AUTOMATION_DIR%" || exit /b 1
 
-                        IF ERRORLEVEL 1 (
-                            echo FAILED > "%WORKSPACE%\\site-status\\archive.txt"
-                            echo [ERROR] Archive process failed
-                            exit /b 1
-                        )
+                            "%ArcPy3%" -m src.runners.archive_runner ^
+                                --config "%CONFIG_DIR%\\app_config.yaml" ^
+                                --logging "%CONFIG_DIR%\\logging.yaml" ^
+                                --env "%ENV_NAME%" ^
+                                --destination "${params.ARCHIVE_DESTINATION}" ^
+                                ${forceDate} ${dryRun}
 
-                        echo SUCCESS > "%WORKSPACE%\\site-status\\archive.txt"
-                        echo [SUCCESS] Archive process completed
-                        exit /b 0
-                    """
+                            IF ERRORLEVEL 1 (
+                                echo FAILED > "%WORKSPACE%\\site-status\\archive.txt"
+                                echo [ERROR] Archive process failed
+                                exit /b 1
+                            )
+
+                            echo SUCCESS > "%WORKSPACE%\\site-status\\archive.txt"
+                            echo [SUCCESS] Archive process completed
+                            exit /b 0
+                        """
+                    }
                 }
             }
         }
