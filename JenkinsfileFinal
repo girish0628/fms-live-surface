@@ -1,0 +1,324 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'FMS_FORCE_DATE',
+            defaultValue: '',
+            description: 'Optional: Force processing date in YYYYMMDD format. Example: 20260505'
+        )
+
+        string(
+            name: 'FMS_RUN_TIMESTAMP',
+            defaultValue: '',
+            description: 'Optional: Override run timestamp. Example: 2026050512:28 or 202605051228'
+        )
+    }
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Load Config Flags') {
+            steps {
+                script {
+                    // ==============================
+                    // Test values
+                    // Later you can replace these
+                    // with real Jenkins parameters
+                    // or environment variables
+                    // ==============================
+                    env.ENV_NAME = 'TEST'
+                    env.SITES = 'SITE_A,SITE_B,SITE_C'
+                    env.DRY_RUN = 'true'
+                    env.ENABLE_ARCHIVE_ARTIFACTS = 'false'
+
+                    // ==============================
+                    // Enable / Disable stages
+                    // ==============================
+                    env.ENABLE_HOURLY          = 'true'
+                    env.ENABLE_HOURLY_FINALIZE = 'true'
+                    env.ENABLE_DAILY_MERGE     = 'true'
+                    env.ENABLE_DAILY_CLEANUP   = 'false'
+                    env.ENABLE_ARCHIVE         = 'true'
+                    env.ENABLE_WEEKLY          = 'false'
+
+                    echo "Config Flags Loaded:"
+                    echo "ENV_NAME = ${env.ENV_NAME}"
+                    echo "SITES    = ${env.SITES}"
+                    echo "HOURLY   = ${env.ENABLE_HOURLY}"
+                    echo "DAILY    = ${env.ENABLE_DAILY_MERGE}"
+                    echo "ARCHIVE  = ${env.ENABLE_ARCHIVE}"
+                }
+            }
+        }
+
+        stage('Setup Runtime') {
+            steps {
+                script {
+                    def perthTz = TimeZone.getTimeZone('Australia/Perth')
+                    def now = new Date()
+
+                    def forceDateParam = params.FMS_FORCE_DATE?.trim()
+                    def runTimestampParam = params.FMS_RUN_TIMESTAMP?.trim()
+
+                    def runDate
+                    def runHour
+                    def runMinute
+                    def finalTimestamp
+
+                    /*
+                        Priority:
+                        1. If FMS_RUN_TIMESTAMP is provided, use its date and time.
+                        2. Else if FMS_FORCE_DATE is provided, use that date + current Perth time.
+                        3. Else scheduled/default run, use current Perth date and time.
+                    */
+
+                    if (runTimestampParam) {
+                        // Supported formats:
+                        // 2026050512:28
+                        // 202605051228
+                        // 20260505122800
+
+                        def cleanedTimestamp = runTimestampParam.replaceAll('[^0-9]', '')
+
+                        if (cleanedTimestamp.length() < 10) {
+                            error "Invalid FMS_RUN_TIMESTAMP. Use format like 2026050512:28 or 202605051228"
+                        }
+
+                        runDate = cleanedTimestamp.substring(0, 8)
+                        runHour = cleanedTimestamp.substring(8, 10) as Integer
+
+                        if (cleanedTimestamp.length() >= 12) {
+                            runMinute = cleanedTimestamp.substring(10, 12) as Integer
+                        } else {
+                            runMinute = 0
+                        }
+
+                        if (cleanedTimestamp.length() == 10) {
+                            finalTimestamp = cleanedTimestamp + "0000"
+                        } else if (cleanedTimestamp.length() == 12) {
+                            finalTimestamp = cleanedTimestamp + "00"
+                        } else {
+                            finalTimestamp = cleanedTimestamp.substring(0, 14)
+                        }
+
+                        echo "Manual trigger using FMS_RUN_TIMESTAMP"
+                    }
+                    else if (forceDateParam) {
+                        if (!(forceDateParam ==~ /^[0-9]{8}$/)) {
+                            error "Invalid FMS_FORCE_DATE. Use YYYYMMDD format. Example: 20260505"
+                        }
+
+                        runDate = forceDateParam
+                        runHour = now.format('HH', perthTz) as Integer
+                        runMinute = now.format('mm', perthTz) as Integer
+
+                        // Example: 20260505 + current Perth time
+                        finalTimestamp = runDate + now.format('HHmmss', perthTz)
+
+                        echo "Manual trigger using FMS_FORCE_DATE + current Perth time"
+                    }
+                    else {
+                        runDate = now.format('yyyyMMdd', perthTz)
+                        runHour = now.format('HH', perthTz) as Integer
+                        runMinute = now.format('mm', perthTz) as Integer
+                        finalTimestamp = now.format('yyyyMMddHHmmss', perthTz)
+
+                        echo "Scheduled trigger using current Perth date/time"
+                    }
+
+                    def totalMinutes = (runHour * 60) + runMinute
+
+                    /*
+                        Required logic:
+
+                        00:00 AM to 01:00 AM
+                        => Daily job
+
+                        01:01 AM to 23:59 PM
+                        => Hourly job
+                    */
+
+                    if (totalMinutes >= 0 && totalMinutes <= 60) {
+                        env.RUN_MODE = 'daily-merge'
+                    } else {
+                        env.RUN_MODE = 'hourly'
+                    }
+
+                    env.FMS_RUN_TIMESTAMP = finalTimestamp
+
+                    echo "=========================================="
+                    echo "Runtime Decision"
+                    echo "RUN_DATE          : ${runDate}"
+                    echo "RUN_HOUR          : ${runHour}"
+                    echo "RUN_MINUTE        : ${runMinute}"
+                    echo "TOTAL_MINUTES     : ${totalMinutes}"
+                    echo "RUN_MODE          : ${env.RUN_MODE}"
+                    echo "FMS_RUN_TIMESTAMP : ${env.FMS_RUN_TIMESTAMP}"
+                    echo "ENV_NAME          : ${env.ENV_NAME}"
+                    echo "SITES             : ${env.SITES}"
+                    echo "=========================================="
+
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.RUN_MODE} ${env.ENV_NAME} ${env.FMS_RUN_TIMESTAMP}"
+                }
+            }
+        }
+
+        stage('Hourly -- Process Sites Parallel') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'hourly' && env.ENABLE_HOURLY == 'true'
+                }
+            }
+
+            steps {
+                script {
+                    def siteList = (env.SITES ?: '')
+                        .split(',')
+                        .collect { it.trim() }
+                        .findAll { it }
+
+                    if (siteList.isEmpty()) {
+                        error "SITES is empty. Please set env.SITES, example: SITE_A,SITE_B,SITE_C"
+                    }
+
+                    def branches = [:]
+
+                    for (int i = 0; i < siteList.size(); i++) {
+                        def site = siteList[i]
+
+                        branches["Site ${site}"] = {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                bat """
+                                    @echo off
+                                    setlocal
+
+                                    echo ==========================================
+                                    echo Hourly FMS processing
+                                    echo ENV_NAME          = %ENV_NAME%
+                                    echo SITE              = ${site}
+                                    echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                                    echo Date              = %DATE% Time = %TIME%
+                                    echo ==========================================
+
+                                    REM Add your hourly Python/FME command here later
+                                    REM Example:
+                                    REM python hourly_runner.py --site ${site} --timestamp %FMS_RUN_TIMESTAMP%
+
+                                    exit /b 0
+                                """
+                            }
+                        }
+                    }
+
+                    branches.failFast = false
+                    parallel branches
+                }
+            }
+        }
+
+        stage('Daily -- Process Sites Parallel') {
+            when {
+                expression {
+                    return env.RUN_MODE == 'daily-merge' && env.ENABLE_DAILY_MERGE == 'true'
+                }
+            }
+
+            steps {
+                script {
+                    def siteList = (env.SITES ?: '')
+                        .split(',')
+                        .collect { it.trim() }
+                        .findAll { it }
+
+                    if (siteList.isEmpty()) {
+                        error "SITES is empty. Please set env.SITES, example: SITE_A,SITE_B,SITE_C"
+                    }
+
+                    def branches = [:]
+
+                    for (int i = 0; i < siteList.size(); i++) {
+                        def site = siteList[i]
+
+                        branches["Site ${site}"] = {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                bat """
+                                    @echo off
+                                    setlocal
+
+                                    echo ==========================================
+                                    echo Daily FMS processing
+                                    echo ENV_NAME          = %ENV_NAME%
+                                    echo SITE              = ${site}
+                                    echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                                    echo Date              = %DATE% Time = %TIME%
+                                    echo ==========================================
+
+                                    REM Add your daily Python/FME command here later
+                                    REM Example:
+                                    REM python daily_runner.py --site ${site} --timestamp %FMS_RUN_TIMESTAMP%
+
+                                    exit /b 0
+                                """
+                            }
+                        }
+                    }
+
+                    branches.failFast = false
+                    parallel branches
+                }
+            }
+        }
+
+        stage('Nightly -- Archive Input Files') {
+            when {
+                expression {
+                    // Archive will run only after daily mode
+                    return env.RUN_MODE == 'daily-merge' && env.ENABLE_ARCHIVE == 'true'
+                }
+            }
+
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    script {
+                        bat """
+                            @echo off
+                            setlocal
+
+                            echo ==========================================
+                            echo Nightly Archive Process
+                            echo Archive is running after Daily Process
+                            echo ENV_NAME          = %ENV_NAME%
+                            echo FMS_RUN_TIMESTAMP = %FMS_RUN_TIMESTAMP%
+                            echo FMS_FORCE_DATE    = ${params.FMS_FORCE_DATE ?: '(not provided)'}
+                            echo DRY_RUN           = %DRY_RUN%
+                            echo Date              = %DATE% Time = %TIME%
+                            echo ==========================================
+
+                            REM Add your archive command here later
+                            REM Example:
+                            REM python archive_runner.py --timestamp %FMS_RUN_TIMESTAMP% --dry-run
+
+                            exit /b 0
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.ENABLE_ARCHIVE_ARTIFACTS == 'true') {
+                    archiveArtifacts artifacts: 'logs/*.log, site-status/*.txt', allowEmptyArchive: true
+                } else {
+                    echo 'Artifact archive is currently disabled.'
+                }
+            }
+        }
+    }
+}
